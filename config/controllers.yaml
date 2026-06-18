@@ -95,7 +95,7 @@
         type: crisp_controllers/CartesianController
 
       cartesian_impedance_controller:
-        type: crisp_controllers/CartesianController
+        type: my_controller/ImpedanceController
 
       joint_impedance_controller:
         type: crisp_controllers/CartesianController

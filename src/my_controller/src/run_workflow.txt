@@ -1,0 +1,122 @@
+Franka/CRISP 程序运行流程
+
+当前机器人 IP:
+10.90.90.10
+
+
+1. Terminal 1: 连接机器人并启动 controller manager
+
+在仓库根目录运行:
+
+pixi run -e jazzy-crisp franka robot_ip:=10.90.90.10 controllers_yaml:=config/controllers.yaml load_gripper:=true
+
+这个 terminal 要一直开着。
+它负责连接机器人、启动 ros2_control、加载 controller。
+
+
+2. Terminal 2: 如果改了 C++ 代码，先 build
+
+如果修改了这些 C++ 文件，例如:
+- src/my_controller/src/test.cpp
+- src/my_controller/src/impedance_controller.cpp
+- src/my_controller/src/home_position.cpp
+
+需要运行:
+
+pixi run -e jazzy-crisp colcon build --packages-select my_controller
+
+注意:
+不需要关闭 Terminal 1。
+不需要断开机器人再重新连接。
+
+
+3. 运行 impedance test 程序
+
+build 成功后运行:
+
+pixi run -e jazzy-crisp ros2 run my_controller test
+
+这个程序对应:
+src/my_controller/src/test.cpp
+
+作用:
+给 CRISP 的 cartesian_impedance_controller 发送 K、D 和目标位姿矩阵。
+
+
+4. 运行 home position 程序
+
+build 成功后运行:
+
+pixi run -e jazzy-crisp ros2 run my_controller home_position
+
+这个程序对应:
+src/my_controller/src/home_position.cpp
+
+作用:
+让机器人运动到预设的 home joint position。
+
+
+5. 读取当前末端位姿 read_pose
+
+如果只是运行 Python 脚本，不需要 build。
+
+只读取一次:
+
+pixi run -e jazzy-crisp read_pose --once
+
+或者直接运行文件:
+
+pixi run -e jazzy-crisp python src/my_controller/src/read_pose.py --once
+
+持续打印:
+
+pixi run -e jazzy-crisp read_pose
+
+每秒打印 5 次:
+
+pixi run -e jazzy-crisp read_pose --rate 5
+
+这个脚本对应:
+src/my_controller/src/read_pose.py
+
+作用:
+读取当前末端位姿，打印 position、quaternion、4x4 pose matrix 和 C++ PoseMatrix 格式。
+
+
+6. 什么时候需要 build?
+
+修改 C++:
+需要 build。
+
+修改 Python:
+不需要 build，直接重新运行。
+
+修改 config/controllers.yaml 或 launch 相关内容:
+通常需要重启 Terminal 1。
+
+
+7. 最常用流程
+
+Terminal 1:
+
+pixi run -e jazzy-crisp franka robot_ip:=10.90.90.10 controllers_yaml:=config/controllers.yaml load_gripper:=true
+
+Terminal 2:
+
+pixi run -e jazzy-crisp colcon build --packages-select my_controller
+pixi run -e jazzy-crisp ros2 run my_controller test
+
+
+8. 当前 impedance test 的含义
+
+test.cpp 不是 impedance controller 本体。
+它是一个外部 command client。
+
+它做的事情是:
+- 切换到 cartesian_impedance_controller
+- 设置 stiffness K
+- 设置 damping D
+- 把目标 4x4 位姿矩阵转换成 PoseStamped
+- 发布到 target_pose topic
+
+真正的 impedance 控制律在 CRISP 的 CartesianController 里面执行。

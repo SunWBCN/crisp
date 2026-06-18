@@ -1,0 +1,15 @@
+my_controller:
+  joints:
+    type: string_array
+    default_value: []
+    description: "Names of the joints to command."
+    validation:
+      not_empty<>: null
+  kp:
+    type: double
+    default_value: 0.0
+    description: "Proportional gain applied around the held position (Nm/rad)."
+  kd:
+    type: double
+    default_value: 0.0
+    description: "Damping gain applied on joint velocity (Nm*s/rad)."

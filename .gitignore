@@ -1,9 +1,12 @@
 # pixi environments
-.pixi
-.
-build
-log
-install
-build
-src
-scripts/launch/__pycache__
+.pixi/
+build/
+log/
+install/
+CMakeFiles/
+__pycache__/
+*.py[cod]
+src/crisp_controllers/
+src/franka_description/
+src/franka_ros2/
+src/libfranka/
