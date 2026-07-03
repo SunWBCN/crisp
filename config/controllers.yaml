@@ -1,3 +1,6 @@
+#Terminal 1 :pixi run -e jazzy-crisp franka robot_ip:=10.90.90.10 controllers_yaml:=config/controllers.yaml load_gripper:=false
+#Ternimal 2 :pixi run -e jazzy-crisp python src/my_controller/scripts/my_admittance_controller.py
+
 # This is a namespace agnostic configuration file for the Franka FR3 robot.
 # That is to say, it is not tied to any specific namespace and can be used in
 # any namespace. 
