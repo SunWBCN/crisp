@@ -127,14 +127,14 @@ def run(args):
     from crisp_py.robot import make_robot
 
     mass = parse_vector(args.mass, [8.0, 8.0, 8.0, 6.0, 3.0, 2.0, 1.5], "mass")
-    damping = parse_vector(args.damping, [14.0, 14.0, 14.0, 10.0, 6.0, 4.0, 3.0], "damping")
-    stiffness = parse_vector(args.stiffness, [10.0, 10.0, 10.0, 8.0, 5.0, 3.0, 2.0], "stiffness")
+    damping = parse_vector(args.damping, [50.0, 50.0, 50.0, 38.0, 20.0, 13.0, 9.0], "damping")
+    stiffness = parse_vector(args.stiffness, [60.0, 60.0, 60.0, 45.0, 25.0, 16.0, 10.0], "stiffness")
     threshold = parse_vector(
         args.torque_threshold, [0.4, 0.4, 0.4, 0.35, 0.25, 0.2, 0.15], "torque-threshold")
     max_offset = parse_vector(
-        args.max_offset, [0.30, 0.30, 0.30, 0.25, 0.22, 0.20, 0.20], "max-offset")
+        args.max_offset, [0.08], "max-offset")
     max_velocity = parse_vector(
-        args.max_velocity, [0.35, 0.35, 0.35, 0.35, 0.45, 0.50, 0.60], "max-velocity")
+        args.max_velocity, [1.2], "max-velocity")
 
     robot = make_robot("fr3")
     joint_names = robot.config.joint_names
@@ -249,7 +249,7 @@ def main():
                         help="Maximum target offset from startup pose [rad]. One value or seven values.")
     parser.add_argument("--max-velocity", type=float, nargs="+",
                         help="Maximum virtual target velocity [rad/s]. One value or seven values.")
-    parser.add_argument("--max-acceleration", type=float, default=1.0,
+    parser.add_argument("--max-acceleration", type=float, default=6.0,
                         help="Maximum virtual target acceleration [rad/s^2].")
     parser.add_argument("--print-every", type=float, default=0.5,
                         help="Status print interval [s].")
