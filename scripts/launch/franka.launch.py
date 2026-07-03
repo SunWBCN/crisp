@@ -169,6 +169,13 @@ def generate_robot_nodes(context):
             package="controller_manager",
             executable="spawner",
             namespace=namespace,
+            arguments=["franka_robot_state_broadcaster"],
+            output="screen",
+        ),
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            namespace=namespace,
             arguments=["pose_broadcaster"],
             output="screen",
         ),

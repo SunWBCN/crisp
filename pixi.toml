@@ -20,6 +20,7 @@ ninja = "*"
 libgl-devel = "*"
 
 [environments]
+default = { features = ["jazzy", "dev", "extra", "crisp"] }
 jazzy = { features = ["jazzy", "dev", "extra"] }
 jazzy-crisp = { features = ["jazzy", "dev", "extra", "crisp"] }
 
@@ -45,6 +46,7 @@ ros-jazzy-ros2-control-cmake = ">=0.2.1,<0.3"
 ros-jazzy-ros2-controllers = "*"
 ros-jazzy-xacro = ">=2.0.13,<3"
 rosdep = "*"
+pyserial = "*"  # serial comms for resense_hex21 sensor node
 
 [feature.jazzy.tasks]
 clone = "git clone https://github.com/frankarobotics/franka_ros2.git -b jazzy src/franka_ros2 && git clone https://github.com/frankarobotics/franka_description.git src/franka_description && git clone --recurse-submodules https://github.com/frankarobotics/libfranka.git src/libfranka"
@@ -54,12 +56,13 @@ ignore-gazebo = "touch src/franka_ros2/franka_gazebo/COLCON_IGNORE 2>/dev/null |
 build = "MAKEFLAGS=-j4 colcon build --symlink-install --parallel-workers 8 --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -Wno-dev"
 clone-crisp = "git clone https://github.com/utiasdsl/crisp_controllers.git src/crisp_controllers"
 setup = { depends-on = ["clone", "update-libfranka", "apply-patches", "ignore-gazebo", "build"] }
-franka = "ros2 launch scripts/launch/franka.launch.py"
+franka = "ros2 launch scripts/launch/franka.launch.py controllers_yaml:=config/controllers.yaml"
 
 [feature.crisp.tasks]
 crisp-figure-eight = "python examples/crisp_figure_eight.py"
 crisp-teleop = "python examples/crisp_teleop.py"
 read_pose = "python src/my_controller/src/read_pose.py"
+tune-pd = "python src/my_controller/scripts/tune_joint_pd.py"
 
 [feature.dev.pypi-dependencies]
 ruff= "*"
