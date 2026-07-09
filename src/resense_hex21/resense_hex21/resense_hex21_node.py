@@ -161,7 +161,7 @@ def main(args=None):
 
         rclpy.init(args=args)
 
-        resense_node = ResenseNode(["/dev/ttyACM0"], 2)
+        resense_node = ResenseNode(["/dev/ttyACM0"], 0)
 
         rclpy.spin(resense_node)
 

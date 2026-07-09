@@ -1,0 +1,74 @@
+# Configuration for:
+#   pixi run -e jazzy-crisp ros2 run my_controller cartesian_admittance \
+#     10.90.90.10 --config /home/wenbin/github_repo/crisp_franka/src/my_controller/scripts/cartesian_admittance.yaml
+#
+# The executable loads this file (or the one passed with --config) before starting the
+# real-time controller. Every key below is optional: a missing key keeps the built-in
+# default. The robot hostname (leading CLI arg / --robot-hostname) and the admittance
+# preset (--profile soft|hard) can be overridden on the command line.
+#
+# 6D vectors are ordered [Fx, Fy, Fz, Mx, My, Mz] and must contain exactly 6 numbers.
+
+robot:
+  hostname: 10.90.90.10          # overridden by a leading CLI hostname / --robot-hostname
+
+wrench:
+  source: serial                 # franka | topic | serial
+  serial_port: /dev/ttyACM0      # used when source: serial
+  topic: resense_0               # used when source: topic
+  frame: local                   # local | world
+  sign: 1.0
+  filter_alpha: 0.05
+
+target:
+  # Full TCP target in world/base frame. Give EITHER pose_source: home OR pose, not both.
+  pose_source: home              # 'home' = predefined home TCP pose (no FK, no MuJoCo)
+  # pose: [0.45, 0.0, 0.35, 0.0, 0.0, 0.0]   # [x, y, z, roll, pitch, yaw]; m and rad
+  ramp_time: 3.0                 # s, minimum-jerk ramp to the target pose
+
+# Admittance preset used when --profile is not given on the command line.
+default_profile: soft
+
+admittance:
+  # Shared by every profile. The selected profile supplies stiffness and damping (and may
+  # override mask/mass if it lists them).
+  mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mass: [2.0, 2.0, 2.0, 0.5, 0.5, 0.5]
+
+profiles:
+  # Switch presets with, e.g.:
+  #   ros2 run my_controller cartesian_admittance 10.90.90.10 --profile hard
+  soft:
+    stiffness: [100.0, 100.0, 100.0, 30.0, 30.0, 10.0]
+    damping:   [28.3, 28.3, 28.3, 7.8, 7.8, 4.5]
+  hard:
+    stiffness: [1200.0, 1200.0, 1200.0, 300.0, 300.0, 50.0]
+    damping:   [98.0, 98.0, 98.0, 24.5, 24.5, 10.0]
+
+limits:
+  force_deadband: 4.0            # N
+  max_force: 10.0                # N, saturate measured force magnitude
+  torque_deadband: 0.3           # Nm
+  max_torque: 2.0                # Nm, saturate measured torque magnitude
+  max_translation_offset: 0.15   # m
+  max_rotation_offset: 0.75      # rad
+  max_linear_speed: 0.20         # m/s
+  max_angular_speed: 1.0         # rad/s
+
+run:
+  run_time: -1.0                 # s, negative = run until stopped (Ctrl+C / stop flag)
+  stop_on_settled: false         # stop once the pose settles
+  settle_window: 2.0             # s
+  settle_position_threshold: 0.001   # m
+  settle_rotation_threshold: 0.01    # rad
+  settle_velocity_threshold: 0.005   # m/s and rad/s (inner admittance velocity)
+
+logging:
+  log_pose_error: true           # save a pose-error CSV after control stops
+  pose_log_dir: src/my_controller/admittance_fitting
+  auto_plot: true                # plot the pose-error CSV after control stops
+  plot_output_dir: src/my_controller/admittance_fitting
+  plot_script: src/my_controller/admittance_fitting/plot_ft_and_pose_error.py
+  print_pose_error: true         # periodically print live TCP pose error
+  print_wrench_debug: false      # periodically print wrench pipeline debug data
+  print_period: 0.2              # s, terminal print period

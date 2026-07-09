@@ -35,6 +35,9 @@ find_package(parameter_traits REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(Franka REQUIRED)
+find_package(Threads REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 if(TARGET Eigen3::Eigen)
   set(MY_CONTROLLER_EIGEN_TARGET Eigen3::Eigen)
@@ -62,6 +65,37 @@ add_executable(franka_home_position
   src/home_position.cpp
 )
 set_target_properties(franka_home_position PROPERTIES OUTPUT_NAME home_position)
+
+# Reusable Cartesian admittance controller (no main), so other executables can call
+# runCartesianAdmittanceToTarget() by linking this library and including the header.
+add_library(cartesian_admittance_lib STATIC
+  scripts/cartesian_admittance_controller.cpp
+)
+target_include_directories(cartesian_admittance_lib
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(cartesian_admittance_lib
+  PUBLIC
+    Franka::Franka
+    ${MY_CONTROLLER_EIGEN_TARGET}
+    Threads::Threads
+)
+ament_target_dependencies(cartesian_admittance_lib
+  PUBLIC
+    rclcpp
+    geometry_msgs
+)
+
+add_executable(cartesian_admittance_libfranka
+  scripts/cartesian_admittance.cpp
+)
+set_target_properties(cartesian_admittance_libfranka PROPERTIES OUTPUT_NAME cartesian_admittance)
+
+add_executable(read_hex21
+  scripts/read_hex21.cpp
+)
 
 target_include_directories(${PROJECT_NAME}
   PUBLIC
@@ -107,6 +141,12 @@ target_link_libraries(franka_home_position
     ${PROJECT_NAME}
 )
 
+target_link_libraries(cartesian_admittance_libfranka
+  PRIVATE
+    cartesian_admittance_lib
+    yaml-cpp::yaml-cpp
+)
+
 ament_target_dependencies(impedance_controller_test
   PUBLIC
     rclcpp
@@ -118,6 +158,12 @@ ament_target_dependencies(impedance_controller_test
 ament_target_dependencies(franka_home_position
   PUBLIC
     rclcpp
+)
+
+ament_target_dependencies(cartesian_admittance_libfranka
+  PUBLIC
+    rclcpp
+    geometry_msgs
 )
 
 pluginlib_export_plugin_description_file(controller_interface my_controller.xml)
@@ -138,6 +184,24 @@ install(
 install(
   TARGETS franka_home_position
   RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  TARGETS cartesian_admittance_libfranka
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  TARGETS read_hex21
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+# Default YAML config for the cartesian_admittance wrapper. The wrapper loads it from the
+# source tree by default (see kDefaultConfigPath); this install makes it available in the
+# install/share tree too, e.g. for deployments that run outside the repo checkout.
+install(
+  FILES scripts/cartesian_admittance.yaml
+  DESTINATION share/${PROJECT_NAME}
 )
 
 install(

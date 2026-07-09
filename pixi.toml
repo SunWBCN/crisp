@@ -30,6 +30,7 @@ channels = ["https://prefix.dev/robostack-jazzy"]
 
 [feature.jazzy.dependencies]
 colcon-common-extensions = "*"
+setuptools = "<80"  # setuptools>=80 removed develop/easy_install, breaking colcon --symlink-install for ament_python pkgs
 pinocchio = ">=3.7.0,<4"
 poco = ">=1.14.2,<2"
 ros-jazzy-ament-clang-format = ">=0.17.2,<0.18"

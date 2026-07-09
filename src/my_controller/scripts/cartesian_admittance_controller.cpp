@@ -1,0 +1,1159 @@
+// Implementation of runCartesianAdmittanceToTarget (declared in
+// my_controller/cartesian_admittance.hpp). Contains the wrench pipeline, the Cartesian
+// admittance dynamics, the joint-impedance torque callback, and the debug/CSV logging.
+// No main() lives here so this translation unit can be linked into other executables.
+//pixi run -e jazzy-crisp ros2 run my_controller cartesian_admittance 10.90.90.10 \ --wrench-source serial --serial-port /dev/ttyACM0 --wrench-frame local --wrench-sign 1.0 \ --target-pose-source home --target-ramp-time 3.0 \ --adm-mask 0,0,1,0,0,0 --adm-mass 3,3,3,1,1,1 --adm-stiffness 0,0,80,0,0,0 --adm-damping 0,0,31,0,0,0 \ --stop-on-settled false \ --log-pose-error false --print-pose-error true --print-wrench-debug false
+#include "my_controller/cartesian_admittance.hpp"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <fcntl.h>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <termios.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+#include <Eigen/Dense>
+
+#include <franka/duration.h>
+#include <franka/exception.h>
+#include <franka/model.h>
+#include <franka/rate_limiting.h>
+#include <franka/robot.h>
+
+#include <geometry_msgs/msg/wrench_stamped.hpp>
+#include <rclcpp/rclcpp.hpp>
+
+namespace {
+
+using Vector6d = Eigen::Matrix<double, 6, 1>;
+
+constexpr std::array<double, 7> kJointStiffness = {
+  120.0, 120.0, 120.0, 120.0, 80.0, 80.0, 40.0};
+constexpr std::array<double, 7> kJointDamping = {
+  22.0, 22.0, 22.0, 22.0, 18.0, 18.0, 13.0};
+
+// Mounting angles (deg) that build R_flange_sensor = Rz(yaw)*Ry(pitch)*Rx(roll), the
+// rotation that maps a vector expressed in the SENSOR frame into the flange (EE) frame.
+// Applied only in 'local' wrench-frame mode. 0/0/0 = sensor axes aligned with flange.
+// NOTE: this is the sensor->flange coordinate mapping, i.e. the *inverse* of "rotate the
+// sensor frame by X about Z to reach the flange". Here the sensor frame must be turned
+// 135 deg counter-clockwise (i.e. +135 deg by the right-hand rule about +Z) to coincide
+// with the flange, so the mapping uses yaw = -135.
+constexpr double kSensorMountRollDeg = 0.0;
+constexpr double kSensorMountPitchDeg = 0.0;
+constexpr double kSensorMountYawDeg = -135.0;
+
+// Rigid tool geometry (pure translation along flange +Z, no extra rotation). The control
+// point is the TCP tip. F_p_TCP: flange -> TCP tip (2 cm to sensor + 10 cm tip = 12 cm).
+// S_p_TCP: sensor origin -> TCP tip (10 cm), used to shift the measured moment S -> TCP.
+constexpr std::array<double, 3> kFlangeToTcp = {0.0, 0.0, 0.1215};  // F_p_TCP  [m]
+constexpr std::array<double, 3> kSensorToTcp = {0.0, 0.0, 0.1066};  // S_p_TCP  [m]
+constexpr int kWrenchBiasSamples = 500;
+constexpr size_t kWrenchHistorySize = 2000;   // ~2 s at 1 kHz, retained for reflex post-mortem
+constexpr double kRadToDeg = 57.295779513082320876;
+constexpr size_t kPoseLogMaxCapacity = 120000;   // ~120 s at 1 kHz, preallocated ring buffer
+
+struct WrenchDebugData {
+  std::array<std::atomic<double>, 6> raw{};
+  std::array<std::atomic<double>, 6> bias_removed{};
+  std::array<std::atomic<double>, 6> masked{};
+  std::array<std::atomic<double>, 6> deadbanded{};
+  std::array<std::atomic<double>, 6> filtered{};
+  std::atomic<int> bias_count{0};
+  std::atomic<bool> has_sample{false};
+};
+
+void storeVector(std::array<std::atomic<double>, 6> & target, const Vector6d & source) {
+  for (int i = 0; i < 6; ++i) {
+    target[static_cast<size_t>(i)].store(source(i), std::memory_order_relaxed);
+  }
+}
+
+Vector6d loadVector(const std::array<std::atomic<double>, 6> & source) {
+  Vector6d value;
+  for (int i = 0; i < 6; ++i) {
+    value(i) = source[static_cast<size_t>(i)].load(std::memory_order_relaxed);
+  }
+  return value;
+}
+
+// One control-cycle snapshot of the wrench pipeline, kept in a ring buffer so the
+// samples leading up to a reflex/error can be dumped after control stops.
+struct WrenchSample {
+  double t = 0.0;
+  int bias_count = 0;
+  std::array<double, 6> raw{};
+  std::array<double, 6> bias_removed{};
+  std::array<double, 6> masked{};
+  std::array<double, 6> deadbanded{};
+  std::array<double, 6> filtered{};
+};
+
+std::array<double, 6> toArray(const Vector6d & v) {
+  std::array<double, 6> result{};
+  for (int i = 0; i < 6; ++i) {
+    result[static_cast<size_t>(i)] = v(i);
+  }
+  return result;
+}
+
+// Called from the catch handler (control has already stopped, so no concurrent writer):
+// prints the last sample and writes the retained history to a timestamped CSV.
+void dumpWrenchHistory(
+  const std::vector<WrenchSample> & history, size_t count, const std::string & reason) {
+  if (count == 0) {
+    std::cerr << "No wrench samples were recorded before the stop." << std::endl;
+    return;
+  }
+  const size_t retained = std::min(count, history.size());
+  const size_t start = count - retained;
+  const WrenchSample & last = history[(count - 1) % history.size()];
+
+  std::cerr << std::fixed << std::setprecision(3)
+            << "Last wrench before stop @t=" << last.t << "s | raw F[N]=[" << last.raw[0] << ", "
+            << last.raw[1] << ", " << last.raw[2] << "] T[Nm]=[" << last.raw[3] << ", "
+            << last.raw[4] << ", " << last.raw[5] << "] | filtered F[N]=[" << last.filtered[0]
+            << ", " << last.filtered[1] << ", " << last.filtered[2] << "] T[Nm]=[" << last.filtered[3]
+            << ", " << last.filtered[4] << ", " << last.filtered[5] << "]" << std::endl;
+
+  std::time_t now = std::time(nullptr);
+  char stamp[32];
+  std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
+  const std::string path = std::string("wrench_before_reflex_") + stamp + ".csv";
+
+  std::ofstream out(path);
+  if (!out) {
+    std::cerr << "Could not open " << path << " to save the wrench history." << std::endl;
+    return;
+  }
+  out << std::fixed << std::setprecision(6);
+  out << "# reason: " << reason << "\n";
+  out << "t,bias_count,"
+         "raw_fx,raw_fy,raw_fz,raw_tx,raw_ty,raw_tz,"
+         "bias_removed_fx,bias_removed_fy,bias_removed_fz,bias_removed_tx,bias_removed_ty,bias_removed_tz,"
+         "masked_fx,masked_fy,masked_fz,masked_tx,masked_ty,masked_tz,"
+         "deadbanded_fx,deadbanded_fy,deadbanded_fz,deadbanded_tx,deadbanded_ty,deadbanded_tz,"
+         "filtered_fx,filtered_fy,filtered_fz,filtered_tx,filtered_ty,filtered_tz\n";
+  for (size_t k = start; k < count; ++k) {
+    const WrenchSample & s = history[k % history.size()];
+    out << s.t << "," << s.bias_count;
+    for (double v : s.raw) out << "," << v;
+    for (double v : s.bias_removed) out << "," << v;
+    for (double v : s.masked) out << "," << v;
+    for (double v : s.deadbanded) out << "," << v;
+    for (double v : s.filtered) out << "," << v;
+    out << "\n";
+  }
+  std::cerr << "Recorded " << retained << " wrench samples before the stop to ./" << path
+            << std::endl;
+}
+
+void printWrenchLine(const char * label, const Vector6d & wrench) {
+  std::cout << label << " F[N]=[" << wrench(0) << ", " << wrench(1) << ", " << wrench(2)
+            << "] T[Nm]=[" << wrench(3) << ", " << wrench(4) << ", " << wrench(5) << "]";
+}
+
+void printExternalForceLine(const Vector6d & wrench) {
+  const double force_norm = wrench.head<3>().norm();
+  std::cout << "F_ext[N]=[" << wrench(0) << ", " << wrench(1) << ", " << wrench(2)
+            << "] |F|=" << force_norm << " N";
+}
+
+Eigen::Affine3d arrayToTransform(const std::array<double, 16> & array) {
+  Eigen::Affine3d transform(Eigen::Affine3d::Identity());
+  transform.matrix() = Eigen::Map<const Eigen::Matrix<double, 4, 4, Eigen::ColMajor>>(array.data());
+  return transform;
+}
+
+std::array<double, 16> transformToArray(
+  const Eigen::Vector3d & position, const Eigen::Matrix3d & rotation) {
+  Eigen::Matrix<double, 4, 4, Eigen::ColMajor> transform =
+    Eigen::Matrix<double, 4, 4, Eigen::ColMajor>::Identity();
+  transform.template topLeftCorner<3, 3>() = rotation;
+  transform.template topRightCorner<3, 1>() = position;
+
+  std::array<double, 16> array{};
+  Eigen::Map<Eigen::Matrix<double, 4, 4, Eigen::ColMajor>>(array.data()) = transform;
+  return array;
+}
+
+Eigen::Vector3d rotationLog(const Eigen::Matrix3d & rotation) {
+  Eigen::Quaterniond q(rotation);
+  q.normalize();
+  if (q.w() < 0.0) {
+    q.coeffs() *= -1.0;
+  }
+
+  const Eigen::Vector3d vec(q.x(), q.y(), q.z());
+  const double vec_norm = vec.norm();
+  if (vec_norm < 1.0e-9) {
+    return Eigen::Vector3d::Zero();
+  }
+
+  const double angle = 2.0 * std::atan2(vec_norm, q.w());
+  return angle * vec / vec_norm;
+}
+
+Eigen::Matrix3d integrateRotation(const Eigen::Matrix3d & rotation, const Eigen::Vector3d & delta) {
+  const double angle = delta.norm();
+  if (angle < 1.0e-12) {
+    return rotation;
+  }
+
+  Eigen::Matrix3d updated = Eigen::AngleAxisd(angle, delta / angle).toRotationMatrix() * rotation;
+  Eigen::Quaterniond normalized(updated);
+  normalized.normalize();
+  return normalized.toRotationMatrix();
+}
+
+void limitVectorNorm(Eigen::Vector3d & value, double max_norm) {
+  const double norm = value.norm();
+  if (norm > max_norm && norm > 1.0e-12) {
+    value *= max_norm / norm;
+  }
+}
+
+Eigen::Matrix<double, 6, 6> diagonalMatrix(const std::array<double, 6> & values) {
+  Eigen::Matrix<double, 6, 6> matrix = Eigen::Matrix<double, 6, 6>::Zero();
+  for (int i = 0; i < 6; ++i) {
+    matrix(i, i) = values[static_cast<size_t>(i)];
+  }
+  return matrix;
+}
+
+// Minimum-jerk scaling s(t) in [0, 1] used to ramp the desired pose from start to target:
+// s = 10*tau^3 - 15*tau^4 + 6*tau^5 with tau = clamp(t/duration, 0, 1). Zero velocity and
+// acceleration at both ends, so the transition never produces a sudden command.
+double minimumJerkScale(double t, double duration) {
+  if (duration <= 0.0) {
+    return 1.0;
+  }
+  const double tau = std::clamp(t / duration, 0.0, 1.0);
+  return tau * tau * tau * (10.0 + tau * (-15.0 + 6.0 * tau));
+}
+
+class RealtimeInputs : public rclcpp::Node {
+public:
+  explicit RealtimeInputs(const std::string & wrench_topic)
+  : Node("libfranka_cartesian_admittance")
+  {
+    for (auto & value : wrench_) {
+      value.store(0.0, std::memory_order_relaxed);
+    }
+
+    wrench_sub_ = create_subscription<geometry_msgs::msg::WrenchStamped>(
+      wrench_topic, rclcpp::SensorDataQoS(),
+      [this](const geometry_msgs::msg::WrenchStamped::SharedPtr msg) {
+        wrench_[0].store(msg->wrench.force.x, std::memory_order_relaxed);
+        wrench_[1].store(msg->wrench.force.y, std::memory_order_relaxed);
+        wrench_[2].store(msg->wrench.force.z, std::memory_order_relaxed);
+        wrench_[3].store(msg->wrench.torque.x, std::memory_order_relaxed);
+        wrench_[4].store(msg->wrench.torque.y, std::memory_order_relaxed);
+        wrench_[5].store(msg->wrench.torque.z, std::memory_order_relaxed);
+        has_wrench_.store(true, std::memory_order_release);
+      });
+
+    RCLCPP_INFO(get_logger(), "Reading wrench from '%s'.", wrench_topic.c_str());
+  }
+
+  Vector6d wrench() const {
+    Vector6d value;
+    for (int i = 0; i < 6; ++i) {
+      value(i) = wrench_[static_cast<size_t>(i)].load(std::memory_order_relaxed);
+    }
+    return value;
+  }
+
+  bool hasWrench() const {
+    return has_wrench_.load(std::memory_order_acquire);
+  }
+
+private:
+  std::array<std::atomic<double>, 6> wrench_{};
+  std::atomic<bool> has_wrench_{false};
+  rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr wrench_sub_;
+};
+
+class SerialWrenchReader {
+public:
+  explicit SerialWrenchReader(const std::string & port) : port_(port) {
+    openPort();
+    read_thread_ = std::thread([this]() { readLoop(); });
+  }
+
+  ~SerialWrenchReader() {
+    running_.store(false, std::memory_order_release);
+    if (read_thread_.joinable()) {
+      read_thread_.join();
+    }
+    if (fd_ >= 0) {
+      ::close(fd_);
+    }
+  }
+
+  Vector6d wrench() const {
+    Vector6d value;
+    for (int i = 0; i < 6; ++i) {
+      value(i) = wrench_[static_cast<size_t>(i)].load(std::memory_order_relaxed);
+    }
+    return value;
+  }
+
+  bool hasWrench() const {
+    return has_wrench_.load(std::memory_order_acquire);
+  }
+
+private:
+  void openPort() {
+    fd_ = ::open(port_.c_str(), O_RDWR | O_NOCTTY);
+    if (fd_ < 0) {
+      throw std::runtime_error(
+        "Failed to open serial port '" + port_ + "': " + std::strerror(errno));
+    }
+
+    termios tty{};
+    if (tcgetattr(fd_, &tty) != 0) {
+      throw std::runtime_error(
+        "Failed to read serial settings for '" + port_ + "': " + std::strerror(errno));
+    }
+
+    cfmakeraw(&tty);
+    cfsetispeed(&tty, B2000000);
+    cfsetospeed(&tty, B2000000);
+    tty.c_cflag |= static_cast<tcflag_t>(CLOCAL | CREAD);
+    tty.c_cflag &= static_cast<tcflag_t>(~CSIZE);
+    tty.c_cflag |= CS8;
+    tty.c_cflag &= static_cast<tcflag_t>(~PARENB);
+    tty.c_cflag &= static_cast<tcflag_t>(~CSTOPB);
+    tty.c_cflag &= static_cast<tcflag_t>(~CRTSCTS);
+    tty.c_cc[VMIN] = 28;
+    tty.c_cc[VTIME] = 0;
+
+    if (tcsetattr(fd_, TCSANOW, &tty) != 0) {
+      throw std::runtime_error(
+        "Failed to configure serial port '" + port_ + "': " + std::strerror(errno));
+    }
+    tcflush(fd_, TCIFLUSH);
+  }
+
+  bool readExact(std::array<unsigned char, 28> & buffer) {
+    size_t offset = 0;
+    while (running_.load(std::memory_order_acquire) && offset < buffer.size()) {
+      const ssize_t n = ::read(fd_, buffer.data() + offset, buffer.size() - offset);
+      if (n > 0) {
+        offset += static_cast<size_t>(n);
+      } else if (n < 0) {
+        return false;
+      }
+    }
+    return offset == buffer.size();
+  }
+
+  void readLoop() {
+    std::array<unsigned char, 28> frame{};
+    while (running_.load(std::memory_order_acquire)) {
+      if (!readExact(frame)) {
+        continue;
+      }
+
+      for (int i = 0; i < 6; ++i) {
+        float value = 0.0F;
+        std::memcpy(&value, frame.data() + static_cast<size_t>(i) * sizeof(float), sizeof(float));
+        wrench_[static_cast<size_t>(i)].store(static_cast<double>(value), std::memory_order_relaxed);
+      }
+      has_wrench_.store(true, std::memory_order_release);
+    }
+  }
+
+  std::string port_;
+  int fd_{-1};
+  std::array<std::atomic<double>, 6> wrench_{};
+  std::atomic<bool> has_wrench_{false};
+  std::atomic<bool> running_{true};
+  std::thread read_thread_;
+};
+
+Vector6d frankaWrenchWorld(const franka::RobotState & state, const Eigen::Matrix3d & current_rotation,
+                           const std::string & wrench_frame) {
+  Vector6d wrench;
+  const auto & source = wrench_frame == "local" ? state.K_F_ext_hat_K : state.O_F_ext_hat_K;
+  for (int i = 0; i < 6; ++i) {
+    wrench(i) = source[static_cast<size_t>(i)];
+  }
+
+  if (wrench_frame == "local") {
+    wrench.head<3>() = current_rotation * wrench.head<3>();
+    wrench.tail<3>() = current_rotation * wrench.tail<3>();
+  }
+  return wrench;
+}
+
+// ---- Pose-error monitoring, settling detection and CSV logging (terminal tuning) ----
+
+std::array<double, 3> toArray3(const Eigen::Vector3d & v) {
+  return {v.x(), v.y(), v.z()};
+}
+
+void storeVector3(std::array<std::atomic<double>, 3> & target, const Eigen::Vector3d & source) {
+  for (int i = 0; i < 3; ++i) {
+    target[static_cast<size_t>(i)].store(source(i), std::memory_order_relaxed);
+  }
+}
+
+// Latest pose error, shared with the periodic printer thread; written from the RT callback.
+struct PoseDebugData {
+  std::array<std::atomic<double>, 3> actual{};
+  std::array<std::atomic<double>, 3> position_error{};
+  std::atomic<double> position_error_norm{0.0};
+  std::array<std::atomic<double>, 3> orientation_error{};
+  std::atomic<double> orientation_error_norm_rad{0.0};
+  std::atomic<double> orientation_error_norm_deg{0.0};
+  // Human-readable RPY breakdown in degrees (convention R = Rz(yaw)*Ry(pitch)*Rx(roll)).
+  std::array<std::atomic<double>, 3> orientation_error_rpy_deg{};
+  std::array<std::atomic<double>, 3> actual_rpy_deg{};
+  std::array<std::atomic<double>, 3> target_rpy_deg{};
+  std::atomic<bool> has_sample{false};
+};
+
+// One row of the pose-error log, kept in a preallocated ring buffer (no RT allocation).
+struct PoseSample {
+  double t = 0.0;
+  std::array<double, 3> target{};
+  std::array<double, 3> actual{};
+  std::array<double, 3> inner{};
+  std::array<double, 3> position_error{};
+  double position_error_norm = 0.0;
+  std::array<double, 3> orientation_error{};
+  double orientation_error_norm_rad = 0.0;
+  double orientation_error_norm_deg = 0.0;
+  std::array<double, 3> target_rpy_deg{};   // [roll, pitch, yaw]
+  std::array<double, 3> actual_rpy_deg{};   // [roll, pitch, yaw]
+  std::array<double, 3> error_rpy_deg{};    // wrapped target - actual, [roll, pitch, yaw]
+  std::array<double, 3> inner_velocity{};
+  std::array<double, 3> filtered_force{};
+  std::array<double, 3> masked_force{};
+};
+
+struct PoseError {
+  Eigen::Vector3d position_error = Eigen::Vector3d::Zero();
+  double position_error_norm = 0.0;
+  Eigen::Vector3d orientation_error = Eigen::Vector3d::Zero();      // rotation-log vector (rad)
+  double orientation_error_norm_rad = 0.0;
+  double orientation_error_norm_deg = 0.0;
+  // Human-readable RPY breakdown (rad), convention R = Rz(yaw)*Ry(pitch)*Rx(roll). Debug
+  // only -- the rotation-log fields above stay the true orientation error / its norm.
+  Eigen::Vector3d target_rpy = Eigen::Vector3d::Zero();
+  Eigen::Vector3d actual_rpy = Eigen::Vector3d::Zero();
+  Eigen::Vector3d orientation_error_rpy = Eigen::Vector3d::Zero();  // wrap(target_rpy - actual_rpy)
+};
+
+// Wrap an angle to (-pi, pi] with no branching/allocation (RT-safe).
+double wrapToPi(double angle) {
+  return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+// e_p = p_actual - p_target, e_R = log(R_target * R_actual^T) (the true orientation error).
+// Also fills a per-axis RPY breakdown -- target, actual, and their wrapped difference -- for
+// human-readable debugging; this is NOT the rotation-log vector. RT-safe (stack only).
+PoseError computePoseError(
+  const Eigen::Vector3d & target_position, const Eigen::Matrix3d & target_rotation,
+  const Eigen::Vector3d & actual_position, const Eigen::Matrix3d & actual_rotation) {
+  PoseError error;
+  error.position_error = actual_position - target_position;
+  error.position_error_norm = error.position_error.norm();
+  error.orientation_error = rotationLog(target_rotation * actual_rotation.transpose());
+  error.orientation_error_norm_rad = error.orientation_error.norm();
+  error.orientation_error_norm_deg = error.orientation_error_norm_rad * kRadToDeg;
+  error.target_rpy = my_controller::rotationMatrixToRPY(target_rotation);
+  error.actual_rpy = my_controller::rotationMatrixToRPY(actual_rotation);
+  for (int i = 0; i < 3; ++i) {
+    error.orientation_error_rpy(i) = wrapToPi(error.target_rpy(i) - error.actual_rpy(i));
+  }
+  return error;
+}
+
+void printSettledSummary(
+  const Eigen::Vector3d & target_position, const Eigen::Vector3d & stable_position,
+  const PoseError & error) {
+  std::cout << "\n===== Settled Pose Error Summary =====\n";
+  std::cout << std::fixed << std::setprecision(4);
+  std::cout << "Target TCP position [m]:        [" << target_position.x() << ", "
+            << target_position.y() << ", " << target_position.z() << "]\n";
+  std::cout << "Stable TCP position [m]:        [" << stable_position.x() << ", "
+            << stable_position.y() << ", " << stable_position.z() << "]\n";
+  std::cout << "Position error [m]:             [" << error.position_error.x() << ", "
+            << error.position_error.y() << ", " << error.position_error.z() << "]\n";
+  std::cout << "Position error norm [m]:        " << error.position_error_norm << "\n\n";
+  std::cout << std::setprecision(3);
+  std::cout << "Orientation error vector [rad]: [" << error.orientation_error.x() << ", "
+            << error.orientation_error.y() << ", " << error.orientation_error.z() << "]\n";
+  std::cout << std::setprecision(4);
+  std::cout << "Orientation error norm [rad]:   " << error.orientation_error_norm_rad << "\n";
+  std::cout << std::setprecision(2);
+  std::cout << "Orientation error norm [deg]:   " << error.orientation_error_norm_deg << "\n";
+  std::cout << "======================================" << std::endl;
+}
+
+// Called after control has stopped (no concurrent writer): writes the retained ring-buffer
+// rows to a timestamped CSV so return-to-target accuracy can be analysed offline.
+std::string shellQuote(const std::string & value) {
+  std::string quoted = "'";
+  for (char c : value) {
+    if (c == '\'') {
+      quoted += "'\\''";
+    } else {
+      quoted += c;
+    }
+  }
+  quoted += "'";
+  return quoted;
+}
+
+std::optional<std::filesystem::path> writePoseLogCsv(
+  const std::vector<PoseSample> & log, size_t count, const std::string & output_dir) {
+  if (count == 0) {
+    std::cerr << "No pose samples were recorded; skipping pose CSV." << std::endl;
+    return std::nullopt;
+  }
+  const size_t retained = std::min(count, log.size());
+  const size_t start = count - retained;
+
+  std::time_t now = std::time(nullptr);
+  char stamp[32];
+  std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
+  std::filesystem::path directory(output_dir.empty() ? "." : output_dir);
+  std::error_code ec;
+  std::filesystem::create_directories(directory, ec);
+  if (ec) {
+    std::cerr << "Could not create pose log directory '" << directory.string()
+              << "': " << ec.message() << std::endl;
+    return std::nullopt;
+  }
+  const std::filesystem::path path = directory / (std::string("pose_error_") + stamp + ".csv");
+
+  std::ofstream out(path);
+  if (!out) {
+    std::cerr << "Could not open " << path.string() << " to save the pose log." << std::endl;
+    return std::nullopt;
+  }
+  out << std::fixed << std::setprecision(6);
+  out << "t,"
+         "target_x,target_y,target_z,"
+         "actual_x,actual_y,actual_z,"
+         "inner_x,inner_y,inner_z,"
+         "position_error_x,position_error_y,position_error_z,position_error_norm,"
+         "orientation_error_x,orientation_error_y,orientation_error_z,"
+         "orientation_error_norm_rad,orientation_error_norm_deg,"
+         "target_roll_deg,target_pitch_deg,target_yaw_deg,"
+         "actual_roll_deg,actual_pitch_deg,actual_yaw_deg,"
+         "error_roll_deg,error_pitch_deg,error_yaw_deg,"
+         "inner_vx,inner_vy,inner_vz,"
+         "filtered_fx,filtered_fy,filtered_fz,"
+         "masked_fx,masked_fy,masked_fz\n";
+  for (size_t k = start; k < count; ++k) {
+    const PoseSample & s = log[k % log.size()];
+    out << s.t;
+    for (double v : s.target) out << "," << v;
+    for (double v : s.actual) out << "," << v;
+    for (double v : s.inner) out << "," << v;
+    for (double v : s.position_error) out << "," << v;
+    out << "," << s.position_error_norm;
+    for (double v : s.orientation_error) out << "," << v;
+    out << "," << s.orientation_error_norm_rad << "," << s.orientation_error_norm_deg;
+    for (double v : s.target_rpy_deg) out << "," << v;
+    for (double v : s.actual_rpy_deg) out << "," << v;
+    for (double v : s.error_rpy_deg) out << "," << v;
+    for (double v : s.inner_velocity) out << "," << v;
+    for (double v : s.filtered_force) out << "," << v;
+    for (double v : s.masked_force) out << "," << v;
+    out << "\n";
+  }
+  std::cerr << "Recorded " << retained << " pose samples to " << path.string() << std::endl;
+  return path;
+}
+
+void plotPoseLogCsv(
+  const std::filesystem::path & csv_path,
+  const std::string & plot_script,
+  const std::string & output_dir) {
+  std::filesystem::path directory(output_dir.empty() ? "." : output_dir);
+  std::error_code ec;
+  std::filesystem::create_directories(directory, ec);
+  if (ec) {
+    std::cerr << "Could not create plot output directory '" << directory.string()
+              << "': " << ec.message() << std::endl;
+    return;
+  }
+
+  const std::string csv_stem = csv_path.stem().string();
+  const std::string prefix = "pose_error_";
+  const std::string suffix =
+    csv_stem.rfind(prefix, 0) == 0 ? csv_stem.substr(prefix.size()) : csv_stem;
+  const std::filesystem::path output_path =
+    directory / (std::string("ft_sensor_and_pose_error_") + suffix + ".png");
+
+  const std::string command =
+    "MPLCONFIGDIR=/tmp python " + shellQuote(plot_script) + " " + shellQuote(csv_path.string()) +
+    " -o " + shellQuote(output_path.string());
+
+  std::cerr << "Generating plot from " << csv_path.string() << std::endl;
+  const int status = std::system(command.c_str());
+  if (status != 0) {
+    std::cerr << "Auto plot command failed with status " << status
+              << ". Command: " << command << std::endl;
+    return;
+  }
+  std::cerr << "Saved plot to " << output_path.string() << std::endl;
+}
+
+}  // namespace
+
+namespace my_controller {
+
+void runCartesianAdmittanceToTarget(const CartesianAdmittanceConfig & config) {
+  // Initialize ROS only if the caller has not already done so, and remember it so we only
+  // shut down what we started. rclcpp::ok() also doubles as a stop signal (Ctrl+C) below.
+  const bool ros_owned = !rclcpp::ok();
+  if (ros_owned) {
+    rclcpp::init(0, nullptr);
+  }
+
+  // The wrench-topic source needs a spinning node; serial/franka sources do not. A
+  // cancellable executor lets us stop our spin without shutting down a caller's ROS.
+  const bool uses_topic = config.wrench_source == "topic";
+  std::shared_ptr<RealtimeInputs> node;
+  rclcpp::executors::SingleThreadedExecutor executor;
+  std::thread ros_thread;
+
+  WrenchDebugData wrench_debug;
+  PoseDebugData pose_debug;
+  std::atomic<bool> print_wrench{false};
+  std::thread wrench_print_thread;
+  std::vector<WrenchSample> wrench_history(kWrenchHistorySize);
+  size_t wrench_history_count = 0;
+
+  // Pose-error log ring buffer (allocated only when logging is enabled; capped so an
+  // infinite run keeps only the most recent samples) plus the settled pose captured for
+  // the final summary. Declared before the try so they survive an exception and can be
+  // dumped/printed after control stops.
+  const size_t pose_log_capacity =
+    config.run_time > 0.0
+      ? std::min(static_cast<size_t>(config.run_time * 1000.0) + 1000, kPoseLogMaxCapacity)
+      : kPoseLogMaxCapacity;
+  std::vector<PoseSample> pose_log(config.log_pose_error ? pose_log_capacity : 0);
+  size_t pose_log_count = 0;
+
+  const Eigen::Vector3d target_position = config.target_position_world;
+  Eigen::Matrix3d target_rotation =
+    config.target_rotation_world.value_or(Eigen::Matrix3d::Identity());
+  std::atomic<bool> settled{false};
+  bool settle_captured = false;
+  Eigen::Vector3d stable_position = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d stable_rotation = Eigen::Matrix3d::Identity();
+
+  try {
+    std::unique_ptr<SerialWrenchReader> serial_reader;
+    if (config.wrench_source == "serial") {
+      serial_reader = std::make_unique<SerialWrenchReader>(config.serial_port);
+      std::cout << "Reading HEX21 wrench directly from serial port '" << config.serial_port
+                << "'." << std::endl;
+    }
+    if (uses_topic) {
+      node = std::make_shared<RealtimeInputs>(config.wrench_topic);
+      executor.add_node(node);
+      ros_thread = std::thread([&executor]() { executor.spin(); });
+    }
+
+    franka::Robot robot(config.robot_hostname);
+    robot.automaticErrorRecovery();
+    franka::Model model = robot.loadModel();
+
+    // Collision reflex effectively disabled: thresholds set to 100 Nm / 100 N,
+    // higher than the robot can physically produce, so contact never trips a reflex.
+    // WARNING: the arm will NOT auto-stop on unexpected collisions.
+    robot.setCollisionBehavior(
+      {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+      {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+      {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+      {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+      {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+      {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+      {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+      {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}});
+
+    const Eigen::Matrix<double, 6, 6> adm_mass_inv = diagonalMatrix(config.admittance_mass).inverse();
+    const Eigen::Matrix<double, 6, 6> adm_stiffness = diagonalMatrix(config.admittance_stiffness);
+    const Eigen::Matrix<double, 6, 6> adm_damping = diagonalMatrix(config.admittance_damping);
+    const Vector6d admittance_mask = Eigen::Map<const Vector6d>(config.admittance_mask.data());
+
+    // Fixed sensor->flange rotation from the configured mounting angles (built once).
+    // Maps a vector expressed in the sensor frame into the flange (EE) frame; the live
+    // EE rotation then carries it the rest of the way to world.
+    constexpr double kDeg2Rad = 0.017453292519943295;
+    const Eigen::Matrix3d R_flange_sensor =
+      (Eigen::AngleAxisd(kSensorMountYawDeg * kDeg2Rad, Eigen::Vector3d::UnitZ()) *
+       Eigen::AngleAxisd(kSensorMountPitchDeg * kDeg2Rad, Eigen::Vector3d::UnitY()) *
+       Eigen::AngleAxisd(kSensorMountRollDeg * kDeg2Rad, Eigen::Vector3d::UnitX()))
+        .toRotationMatrix();
+
+    // Rigid tool transforms (built once). F_T_TCP is a pure +Z translation to the tip, so
+    // the control point is the TCP; S_p_TCP is the sensor-origin -> TCP offset for the
+    // moment shift. Orientation of the TCP equals the flange orientation.
+    Eigen::Affine3d F_T_TCP = Eigen::Affine3d::Identity();
+    F_T_TCP.translation() = Eigen::Vector3d(kFlangeToTcp[0], kFlangeToTcp[1], kFlangeToTcp[2]);
+    const Eigen::Vector3d S_p_TCP(kSensorToTcp[0], kSensorToTcp[1], kSensorToTcp[2]);
+
+    bool initialized = false;
+    Eigen::Vector3d initial_position = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d initial_rotation = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d ramp_rotation_vector = Eigen::Vector3d::Zero();
+    Eigen::Vector3d inner_position = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d inner_rotation = Eigen::Matrix3d::Identity();
+    Vector6d inner_velocity = Vector6d::Zero();
+    Vector6d wrench_bias = Vector6d::Zero();
+    Vector6d wrench_bias_accumulator = Vector6d::Zero();
+    Vector6d wrench_filtered = Vector6d::Zero();
+    int wrench_bias_count = 0;
+    double elapsed_time = 0.0;
+    std::atomic<bool> control_finished{false};
+
+    // Settling-detector working state (RT-only; not needed after control stops).
+    Eigen::Vector3d settle_ref_position = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d settle_ref_rotation = Eigen::Matrix3d::Identity();
+    double settle_time = 0.0;
+    bool settle_ref_valid = false;
+
+    auto cartesian_admittance_callback =
+      [&](const franka::RobotState & state, franka::Duration period) -> franka::CartesianPose {
+        const Eigen::Affine3d O_T_F = arrayToTransform(state.O_T_EE);   // flange (EE) pose
+        const Eigen::Affine3d O_T_TCP = O_T_F * F_T_TCP;                // control point = TCP tip
+        const Eigen::Matrix3d current_rotation = O_T_F.linear();        // R_O_F (== R_O_TCP)
+
+        if (!initialized) {
+          // Everything downstream (feedback, admittance, offsets, target, logging) is at TCP.
+          initial_position = O_T_TCP.translation();
+          initial_rotation = O_T_TCP.linear();
+          inner_position = initial_position;
+          inner_rotation = initial_rotation;
+          inner_velocity.setZero();
+          // Freeze the ramp endpoints from the measured start pose. Target orientation is
+          // the caller's if provided, otherwise the start orientation (no reorientation).
+          target_rotation = config.target_rotation_world.value_or(initial_rotation);
+          ramp_rotation_vector = rotationLog(target_rotation * initial_rotation.transpose());
+          initialized = true;
+        }
+
+        // Minimum-jerk ramp of the desired TCP pose from the start pose to the target,
+        // then hold. Prevents a large initial admittance error / sudden command.
+        const double ramp = minimumJerkScale(elapsed_time, config.target_ramp_time);
+        Eigen::Vector3d desired_position =
+          initial_position + ramp * (target_position - initial_position);
+        Eigen::Matrix3d desired_rotation =
+          integrateRotation(initial_rotation, ramp * ramp_rotation_vector);
+
+        Vector6d raw_wrench = Vector6d::Zero();
+        if (config.wrench_source == "franka") {
+          raw_wrench = frankaWrenchWorld(state, current_rotation, config.wrench_frame);
+        } else if (config.wrench_source == "serial") {
+          raw_wrench = serial_reader->wrench();
+        } else {
+          raw_wrench = node->wrench();
+        }
+        raw_wrench *= config.wrench_sign;
+        if (config.wrench_source != "franka" && config.wrench_frame == "local") {
+          // Rotate the sensor wrench into world: R_O_S = R_O_F * R_F_S.
+          const Eigen::Matrix3d R_O_S = current_rotation * R_flange_sensor;
+          const Eigen::Vector3d f_O = R_O_S * raw_wrench.head<3>();
+          const Eigen::Vector3d m_O_at_S = R_O_S * raw_wrench.tail<3>();
+          // Shift the moment from the sensor origin S to the TCP tip (force is unchanged):
+          // m_O_at_TCP = m_O_at_S - (r_S->TCP) x f_O.
+          const Eigen::Vector3d r_O_S_TCP = R_O_S * S_p_TCP;
+          raw_wrench.head<3>() = f_O;
+          raw_wrench.tail<3>() = m_O_at_S - r_O_S_TCP.cross(f_O);
+        }
+
+        const bool has_wrench = config.wrench_source == "franka" ||
+                                (config.wrench_source == "serial" && serial_reader->hasWrench()) ||
+                                (config.wrench_source == "topic" && node->hasWrench());
+        if (has_wrench && wrench_bias_count < kWrenchBiasSamples) {
+          wrench_bias_accumulator += raw_wrench;
+          ++wrench_bias_count;
+          wrench_bias = wrench_bias_accumulator / static_cast<double>(wrench_bias_count);
+        }
+
+        const Vector6d wrench_world = raw_wrench - wrench_bias;
+        // Disable masked-out world-frame axes before deadband/saturation/filtering, so a
+        // 0.0 axis contributes no admittance force regardless of the measured wrench.
+        const Vector6d wrench_masked = wrench_world.cwiseProduct(admittance_mask);
+        Vector6d wrench_deadbanded = wrench_masked;
+        if (wrench_deadbanded.head<3>().norm() < config.force_deadband) {
+          wrench_deadbanded.head<3>().setZero();
+        }
+        // External force saturation: however large the measured force is, cap the
+        // force vector magnitude at max_external_force (direction preserved).
+        Eigen::Vector3d limited_force = wrench_deadbanded.head<3>();
+        limitVectorNorm(limited_force, config.max_external_force);
+        wrench_deadbanded.head<3>() = limited_force;
+        // Same treatment for torque (tail<3>): deadband small values, then cap magnitude,
+        // so a torque spike can't drive a joint-velocity-discontinuity reflex.
+        if (wrench_deadbanded.tail<3>().norm() < config.torque_deadband) {
+          wrench_deadbanded.tail<3>().setZero();
+        }
+        Eigen::Vector3d limited_torque = wrench_deadbanded.tail<3>();
+        limitVectorNorm(limited_torque, config.max_external_torque);
+        wrench_deadbanded.tail<3>() = limited_torque;
+        wrench_filtered = config.wrench_filter_alpha * wrench_deadbanded +
+                          (1.0 - config.wrench_filter_alpha) * wrench_filtered;
+        storeVector(wrench_debug.raw, raw_wrench);
+        storeVector(wrench_debug.bias_removed, wrench_world);
+        storeVector(wrench_debug.masked, wrench_masked);
+        storeVector(wrench_debug.deadbanded, wrench_deadbanded);
+        storeVector(wrench_debug.filtered, wrench_filtered);
+        wrench_debug.bias_count.store(wrench_bias_count, std::memory_order_relaxed);
+        wrench_debug.has_sample.store(true, std::memory_order_release);
+
+        // Append to the ring buffer (preallocated, no allocation in the RT loop).
+        elapsed_time += period.toSec();
+        WrenchSample & history_sample = wrench_history[wrench_history_count % kWrenchHistorySize];
+        history_sample.t = elapsed_time;
+        history_sample.bias_count = wrench_bias_count;
+        history_sample.raw = toArray(raw_wrench);
+        history_sample.bias_removed = toArray(wrench_world);
+        history_sample.masked = toArray(wrench_masked);
+        history_sample.deadbanded = toArray(wrench_deadbanded);
+        history_sample.filtered = toArray(wrench_filtered);
+        ++wrench_history_count;
+
+        Vector6d adm_error;
+        adm_error.head<3>() = desired_position - inner_position;
+        adm_error.tail<3>() = rotationLog(desired_rotation * inner_rotation.transpose());
+
+        const Vector6d adm_force =
+          wrench_filtered - adm_damping * inner_velocity + adm_stiffness * adm_error;
+        Vector6d acceleration = adm_mass_inv * adm_force;
+
+        const double dt = period.toSec();
+        inner_velocity += acceleration * dt;
+        Eigen::Vector3d linear_velocity = inner_velocity.head<3>();
+        Eigen::Vector3d angular_velocity = inner_velocity.tail<3>();
+        limitVectorNorm(linear_velocity, config.max_linear_speed);
+        limitVectorNorm(angular_velocity, config.max_angular_speed);
+        inner_velocity.head<3>() = linear_velocity;
+        inner_velocity.tail<3>() = angular_velocity;
+
+        inner_position += inner_velocity.head<3>() * dt;
+        inner_rotation = integrateRotation(inner_rotation, inner_velocity.tail<3>() * dt);
+
+        Eigen::Vector3d translation_offset = inner_position - desired_position;
+        if (translation_offset.norm() > config.max_translation_offset) {
+          limitVectorNorm(translation_offset, config.max_translation_offset);
+          inner_position = desired_position + translation_offset;
+          inner_velocity.head<3>().setZero();
+        }
+
+        Eigen::Vector3d rotation_offset = rotationLog(inner_rotation * desired_rotation.transpose());
+        if (rotation_offset.norm() > config.max_rotation_offset) {
+          limitVectorNorm(rotation_offset, config.max_rotation_offset);
+          inner_rotation = integrateRotation(desired_rotation, rotation_offset);
+          inner_velocity.tail<3>().setZero();
+        }
+
+        // Pin disabled axes back to the desired pose so masked-out DOFs cannot accumulate
+        // hidden admittance displacement or velocity. Translational axes snap position and
+        // zero velocity directly; rotational axes zero the disabled components of the
+        // world-frame rotation-log offset (and their angular velocity), then rebuild
+        // inner_rotation from the remaining enabled offset.
+        for (int i = 0; i < 3; ++i) {
+          if (admittance_mask(i) == 0.0) {
+            inner_velocity(i) = 0.0;
+            inner_position(i) = desired_position(i);
+          }
+        }
+        if (admittance_mask(3) == 0.0 || admittance_mask(4) == 0.0 || admittance_mask(5) == 0.0) {
+          Eigen::Vector3d masked_rotation_offset =
+            rotationLog(inner_rotation * desired_rotation.transpose());
+          for (int i = 0; i < 3; ++i) {
+            if (admittance_mask(3 + i) == 0.0) {
+              masked_rotation_offset(i) = 0.0;
+              inner_velocity(3 + i) = 0.0;
+            }
+          }
+          inner_rotation = integrateRotation(desired_rotation, masked_rotation_offset);
+        }
+
+        // inner_position / inner_rotation are the desired TCP pose. The motion generator
+        // expects the flange command, so map back: O_T_F_cmd = O_T_TCP_cmd * inv(F_T_TCP).
+        Eigen::Affine3d O_T_TCP_cmd = Eigen::Affine3d::Identity();
+        O_T_TCP_cmd.linear() = inner_rotation;
+        O_T_TCP_cmd.translation() = inner_position;
+        const Eigen::Affine3d O_T_F_cmd = O_T_TCP_cmd * F_T_TCP.inverse();
+
+        franka::CartesianPose pose(transformToArray(O_T_F_cmd.translation(), O_T_F_cmd.linear()));
+
+        // --- Pose-error monitoring against the target, using the measured TCP pose ---
+        const Eigen::Vector3d actual_position = O_T_TCP.translation();
+        const Eigen::Matrix3d actual_rotation = O_T_TCP.linear();
+        const PoseError pose_error =
+          computePoseError(target_position, target_rotation, actual_position, actual_rotation);
+        storeVector3(pose_debug.actual, actual_position);
+        storeVector3(pose_debug.position_error, pose_error.position_error);
+        pose_debug.position_error_norm.store(
+          pose_error.position_error_norm, std::memory_order_relaxed);
+        storeVector3(pose_debug.orientation_error, pose_error.orientation_error);
+        pose_debug.orientation_error_norm_rad.store(
+          pose_error.orientation_error_norm_rad, std::memory_order_relaxed);
+        pose_debug.orientation_error_norm_deg.store(
+          pose_error.orientation_error_norm_deg, std::memory_order_relaxed);
+        storeVector3(pose_debug.orientation_error_rpy_deg,
+                     pose_error.orientation_error_rpy * kRadToDeg);
+        storeVector3(pose_debug.actual_rpy_deg, pose_error.actual_rpy * kRadToDeg);
+        storeVector3(pose_debug.target_rpy_deg, pose_error.target_rpy * kRadToDeg);
+        pose_debug.has_sample.store(true, std::memory_order_release);
+
+        // --- Settling detector: only armed after the ramp; latches once achieved. The
+        // pose is settled when the measured TCP stays within thresholds of a reference
+        // pose and the admittance velocity stays small for settle_window seconds. ---
+        bool settled_now = settle_captured;
+        if (elapsed_time >= config.target_ramp_time && !settle_captured) {
+          const double delta_position = (actual_position - settle_ref_position).norm();
+          const double delta_rotation =
+            rotationLog(actual_rotation * settle_ref_rotation.transpose()).norm();
+          const bool within = settle_ref_valid &&
+                              delta_position < config.settle_position_threshold &&
+                              delta_rotation < config.settle_rotation_threshold &&
+                              inner_velocity.head<3>().norm() < config.settle_velocity_threshold &&
+                              inner_velocity.tail<3>().norm() < config.settle_velocity_threshold;
+          if (within) {
+            settle_time += dt;
+            if (settle_time >= config.settle_window) {
+              settle_captured = true;
+              settled_now = true;
+              stable_position = actual_position;
+              stable_rotation = actual_rotation;
+              settled.store(true, std::memory_order_release);
+            }
+          } else {
+            settle_ref_position = actual_position;
+            settle_ref_rotation = actual_rotation;
+            settle_ref_valid = true;
+            settle_time = 0.0;
+          }
+        }
+
+        // --- Pose-error CSV ring buffer (preallocated; only when logging is enabled) ---
+        if (config.log_pose_error) {
+          PoseSample & sample = pose_log[pose_log_count % pose_log.size()];
+          sample.t = elapsed_time;
+          sample.target = toArray3(target_position);
+          sample.actual = toArray3(actual_position);
+          sample.inner = toArray3(inner_position);
+          sample.position_error = toArray3(pose_error.position_error);
+          sample.position_error_norm = pose_error.position_error_norm;
+          sample.orientation_error = toArray3(pose_error.orientation_error);
+          sample.orientation_error_norm_rad = pose_error.orientation_error_norm_rad;
+          sample.orientation_error_norm_deg = pose_error.orientation_error_norm_deg;
+          sample.target_rpy_deg = toArray3(pose_error.target_rpy * kRadToDeg);
+          sample.actual_rpy_deg = toArray3(pose_error.actual_rpy * kRadToDeg);
+          sample.error_rpy_deg = toArray3(pose_error.orientation_error_rpy * kRadToDeg);
+          sample.inner_velocity = toArray3(inner_velocity.head<3>());
+          sample.filtered_force = toArray3(wrench_filtered.head<3>());
+          sample.masked_force = toArray3(wrench_masked.head<3>());
+          ++pose_log_count;
+        }
+
+        const bool stop =
+          (config.stop_requested && config.stop_requested->load(std::memory_order_relaxed)) ||
+          (config.run_time >= 0.0 && elapsed_time >= config.run_time) ||
+          (config.stop_on_settled && settled_now) ||
+          !rclcpp::ok();
+        if (stop) {
+          control_finished.store(true, std::memory_order_release);
+          return franka::MotionFinished(pose);
+        }
+        return pose;
+      };
+
+    auto joint_impedance_callback =
+      [&](const franka::RobotState & state, franka::Duration /*period*/) -> franka::Torques {
+        const std::array<double, 7> coriolis = model.coriolis(state);
+
+        std::array<double, 7> tau{};
+        for (size_t i = 0; i < tau.size(); ++i) {
+          tau[i] = kJointStiffness[i] * (state.q_d[i] - state.q[i]) -
+                   kJointDamping[i] * state.dq[i] + coriolis[i];
+        }
+
+        const std::array<double, 7> tau_rate_limited =
+          franka::limitRate(franka::kMaxTorqueRate, tau, state.tau_J_d);
+        franka::Torques command(tau_rate_limited);
+        if (control_finished.load(std::memory_order_acquire) || !rclcpp::ok()) {
+          return franka::MotionFinished(command);
+        }
+        return command;
+      };
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "Cartesian admittance -> target TCP position (world) = ["
+              << config.target_position_world.x() << ", " << config.target_position_world.y() << ", "
+              << config.target_position_world.z() << "] m, ramp " << config.target_ramp_time
+              << " s.\n"
+              << "Wrench source: " << config.wrench_source << ", frame: " << config.wrench_frame
+              << ", sign: " << config.wrench_sign << ". Starting control." << std::endl;
+
+    // Live terminal printing is independent of CSV logging and of the control loop: it is
+    // handled here in a non-real-time thread, gated per line by the config flags. The
+    // force sensor, wrench pipeline and admittance control always run regardless, so
+    // disabling a print only silences the terminal.
+    const bool live_printing = config.print_pose_error || config.print_wrench_debug;
+    const auto print_period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(std::max(config.print_period, 0.01)));
+    if (live_printing) {
+      print_wrench.store(true, std::memory_order_release);
+      wrench_print_thread = std::thread([&, print_period]() {
+        std::cout << std::fixed << std::setprecision(3);
+        while (print_wrench.load(std::memory_order_acquire) && rclcpp::ok()) {
+          if (config.print_wrench_debug &&
+              wrench_debug.has_sample.load(std::memory_order_acquire)) {
+            const Vector6d raw_wrench = loadVector(wrench_debug.raw);
+            const Vector6d bias_removed_wrench = loadVector(wrench_debug.bias_removed);
+            const Vector6d masked_wrench = loadVector(wrench_debug.masked);
+            const Vector6d deadbanded_wrench = loadVector(wrench_debug.deadbanded);
+            const Vector6d filtered_wrench = loadVector(wrench_debug.filtered);
+            const int bias_count = wrench_debug.bias_count.load(std::memory_order_relaxed);
+
+            std::cout << "[ft_sensor] ";
+            printExternalForceLine(bias_removed_wrench);
+            std::cout << " | bias " << bias_count << "/" << kWrenchBiasSamples << " | ";
+            printWrenchLine("raw", raw_wrench);
+            std::cout << " | ";
+            printWrenchLine("bias_removed", bias_removed_wrench);
+            std::cout << " | ";
+            printWrenchLine("masked", masked_wrench);
+            std::cout << " | ";
+            printWrenchLine("deadbanded", deadbanded_wrench);
+            std::cout << " | ";
+            printWrenchLine("filtered", filtered_wrench);
+            std::cout << std::endl;
+          }
+          if (config.print_pose_error &&
+              pose_debug.has_sample.load(std::memory_order_acquire)) {
+            const double error_px = pose_debug.position_error[0].load(std::memory_order_relaxed);
+            const double error_py = pose_debug.position_error[1].load(std::memory_order_relaxed);
+            const double error_pz = pose_debug.position_error[2].load(std::memory_order_relaxed);
+            const double error_pnorm =
+              pose_debug.position_error_norm.load(std::memory_order_relaxed);
+            const double error_deg =
+              pose_debug.orientation_error_norm_deg.load(std::memory_order_relaxed);
+            const double err_roll = pose_debug.orientation_error_rpy_deg[0].load(std::memory_order_relaxed);
+            const double err_pitch = pose_debug.orientation_error_rpy_deg[1].load(std::memory_order_relaxed);
+            const double err_yaw = pose_debug.orientation_error_rpy_deg[2].load(std::memory_order_relaxed);
+            const double act_roll = pose_debug.actual_rpy_deg[0].load(std::memory_order_relaxed);
+            const double act_pitch = pose_debug.actual_rpy_deg[1].load(std::memory_order_relaxed);
+            const double act_yaw = pose_debug.actual_rpy_deg[2].load(std::memory_order_relaxed);
+            const double tgt_roll = pose_debug.target_rpy_deg[0].load(std::memory_order_relaxed);
+            const double tgt_pitch = pose_debug.target_rpy_deg[1].load(std::memory_order_relaxed);
+            const double tgt_yaw = pose_debug.target_rpy_deg[2].load(std::memory_order_relaxed);
+            std::cout << "[pose] e_p[m]=[" << error_px << ", " << error_py << ", " << error_pz
+                      << "] |e_p|=" << error_pnorm << " m | e_RPY[deg]=[" << err_roll << ", "
+                      << err_pitch << ", " << err_yaw << "] | |e_R|=" << error_deg << " deg"
+                      << " | actual_RPY[deg]=[" << act_roll << ", " << act_pitch << ", " << act_yaw
+                      << "] target_RPY[deg]=[" << tgt_roll << ", " << tgt_pitch << ", " << tgt_yaw
+                      << "]" << (settled.load(std::memory_order_acquire) ? " | SETTLED" : "")
+                      << std::endl;
+          }
+          std::this_thread::sleep_for(print_period);
+        }
+      });
+    }
+
+    robot.control(joint_impedance_callback, cartesian_admittance_callback);
+  } catch (const franka::ControlException & ex) {
+    // The reflex reason is already in ex.what(); the flags below pinpoint it.
+    std::cerr << "libfranka control error: " << ex.what() << std::endl;
+    // Scan the whole log (newest first) for the state that actually latched the
+    // error flags -- the very last record is often already cleared.
+    bool found_errors = false;
+    for (auto it = ex.log.rbegin(); it != ex.log.rend(); ++it) {
+      const franka::RobotState & s = it->state;
+      if (!s.last_motion_errors && !s.current_errors) {
+        continue;
+      }
+      std::cerr << "Trigger (last_motion_errors): " << s.last_motion_errors << std::endl;
+      std::cerr << "Still active (current_errors): " << s.current_errors << std::endl;
+      std::cerr << std::fixed << std::setprecision(2)
+                << "Robot-estimated external wrench O_F_ext_hat_K = ["
+                << s.O_F_ext_hat_K[0] << ", " << s.O_F_ext_hat_K[1] << ", " << s.O_F_ext_hat_K[2]
+                << " N | " << s.O_F_ext_hat_K[3] << ", " << s.O_F_ext_hat_K[4] << ", "
+                << s.O_F_ext_hat_K[5] << " Nm]" << std::endl;
+      found_errors = true;
+      break;
+    }
+    if (!found_errors) {
+      std::cerr << "No error flags were set across the " << ex.log.size()
+                << " logged state(s); the reason is the message above." << std::endl;
+    }
+    dumpWrenchHistory(wrench_history, wrench_history_count, ex.what());
+  } catch (const franka::Exception & ex) {
+    std::cerr << "libfranka error: " << ex.what() << std::endl;
+    dumpWrenchHistory(wrench_history, wrench_history_count, ex.what());
+  } catch (const std::exception & ex) {
+    std::cerr << "Error: " << ex.what() << std::endl;
+    dumpWrenchHistory(wrench_history, wrench_history_count, ex.what());
+  }
+
+  print_wrench.store(false, std::memory_order_release);
+  if (wrench_print_thread.joinable()) {
+    wrench_print_thread.join();
+  }
+
+  // Settled-pose error summary and pose CSV are emitted here, after control has stopped,
+  // so nothing is printed or written from the real-time callback.
+  if (settle_captured) {
+    const PoseError final_error =
+      computePoseError(target_position, target_rotation, stable_position, stable_rotation);
+    printSettledSummary(target_position, stable_position, final_error);
+  } else {
+    std::cout << "Controller stopped before a settled state was detected "
+                 "(no settled pose summary)." << std::endl;
+  }
+  std::optional<std::filesystem::path> pose_log_path;
+  if (config.log_pose_error) {
+    pose_log_path = writePoseLogCsv(pose_log, pose_log_count, config.pose_log_dir);
+  } else if (config.auto_plot) {
+    std::cerr << "Warning: --auto-plot true requires --log-pose-error true. "
+                 "No pose-error CSV was written, so no plot will be generated."
+              << std::endl;
+  }
+  if (config.auto_plot && pose_log_path.has_value()) {
+    plotPoseLogCsv(*pose_log_path, config.plot_script, config.plot_output_dir);
+  }
+
+  if (uses_topic) {
+    executor.cancel();
+    if (ros_thread.joinable()) {
+      ros_thread.join();
+    }
+  }
+  if (ros_owned) {
+    rclcpp::shutdown();
+  }
+}
+
+}  // namespace my_controller

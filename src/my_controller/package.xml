@@ -26,6 +26,8 @@
   <depend>rclcpp_action</depend>
   <depend>control_msgs</depend>
   <depend>trajectory_msgs</depend>
+  <depend>libfranka</depend>
+  <depend>yaml-cpp</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 
