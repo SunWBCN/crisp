@@ -5,3 +5,40 @@ pixi run -e jazzy-crisp ros2 run my_controller cartesian_admittance 10.90.90.10
 
 Hard:
 pixi run -e jazzy-crisp ros2 run my_controller cartesian_admittance 10.90.90.10 --profile hard
+
+Trajectory with tuned compliant controller:
+pixi run -e jazzy-crisp ros2 run my_controller cartesian_admittance_trajectory 10.90.90.10 --profile soft
+
+Smaller/slower first test:
+pixi run -e jazzy-crisp ros2 run my_controller cartesian_admittance_trajectory 10.90.90.10 --profile soft --step 0.02 --circle-radius 0.015 --segment-time 3.0
+
+Run the two pickled robot TCP trajectories in trajs/ with the tuned compliant controller.
+Default behavior is separate relative-position / faithful-rotation replay:
+traj1 at 30 Hz, smooth return to the measured reset pose, traj2 at 30 Hz, smooth return to the measured reset pose.
+The child command overrides max_linear_speed to 0.5 m/s so the 30 Hz target velocity is not clipped:
+pixi run -e jazzy-crisp ros2 run my_controller run_pickled_admittance_trajectories.py 10.90.90.10
+
+Same, but skip the wrapper's per-trajectory Enter prompts:
+pixi run -e jazzy-crisp ros2 run my_controller run_pickled_admittance_trajectories.py 10.90.90.10 --yes
+
+If libfranka reports an acceleration discontinuity during the initial orientation alignment,
+make the pre-align slower:
+pixi run -e jazzy-crisp ros2 run my_controller run_pickled_admittance_trajectories.py 10.90.90.10 --prealign-time 5.0
+
+To intentionally slow the replay below faithful 30 Hz:
+pixi run -e jazzy-crisp ros2 run my_controller run_pickled_admittance_trajectories.py 10.90.90.10 --sample-period 0.08 --max-linear-speed 0.5
+
+Focus only on traj1. The pickle pose_data is treated as recorded flange pose by default;
+the wrapper converts it to the controller TCP target using the 0.1215 m tool offset.
+Move slowly to traj1's recorded initial flange pose, then replay traj1 faithfully at 30 Hz:
+pixi run -e jazzy-crisp ros2 run my_controller run_pickled_admittance_trajectories.py 10.90.90.10 --trajs trajs/trajectory1.pkl --absolute --prealign-time 5.0 --return-time 0.0
+
+Focus only on traj1 using recorded initial joints as the true initial state.
+After replay, return smoothly to the measured reset pose, then hold before finish:
+pixi run -e jazzy-crisp ros2 run my_controller run_pickled_admittance_trajectories.py 10.90.90.10 --trajs trajs/trajectory1.pkl --move-to-initial-joints --joint-prepose-time 8.0 --return-time 5.0 --post-hold-time 3.0
+
+If libfranka says "Motion finished commanded, but the robot is still moving",
+increase --post-hold-time.
+
+Inspect only, without starting robot control:
+pixi run -e jazzy-crisp ros2 run my_controller run_pickled_admittance_trajectories.py 10.90.90.10 --dry-run

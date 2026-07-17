@@ -72,6 +72,26 @@ bool asBool(const YAML::Node & node, const std::string & key) {
     "config key '" + key + "': expected a boolean (true/false), got '" + raw + "'.");
 }
 
+std::array<double, 3> asVector3(const YAML::Node & node, const std::string & key) {
+  if (!node.IsSequence()) {
+    throw std::invalid_argument("config key '" + key + "': expected a list of 3 numbers.");
+  }
+  std::vector<double> values;
+  try {
+    values = node.as<std::vector<double>>();
+  } catch (const YAML::Exception &) {
+    throw std::invalid_argument("config key '" + key + "': expected 3 numbers.");
+  }
+  if (values.size() != 3) {
+    throw std::invalid_argument(
+      "config key '" + key + "': expected exactly 3 numbers, got " +
+      std::to_string(values.size()) + ".");
+  }
+  std::array<double, 3> out{};
+  std::copy(values.begin(), values.end(), out.begin());
+  return out;
+}
+
 std::array<double, 6> asVector6(const YAML::Node & node, const std::string & key) {
   if (!node.IsSequence()) {
     throw std::invalid_argument("config key '" + key + "': expected a list of 6 numbers.");
@@ -88,6 +108,46 @@ std::array<double, 6> asVector6(const YAML::Node & node, const std::string & key
       std::to_string(values.size()) + ".");
   }
   std::array<double, 6> out{};
+  std::copy(values.begin(), values.end(), out.begin());
+  return out;
+}
+
+std::array<double, 7> asVector7(const YAML::Node & node, const std::string & key) {
+  if (!node.IsSequence()) {
+    throw std::invalid_argument("config key '" + key + "': expected a list of 7 numbers.");
+  }
+  std::vector<double> values;
+  try {
+    values = node.as<std::vector<double>>();
+  } catch (const YAML::Exception &) {
+    throw std::invalid_argument("config key '" + key + "': expected 7 numbers.");
+  }
+  if (values.size() != 7) {
+    throw std::invalid_argument(
+      "config key '" + key + "': expected exactly 7 numbers, got " +
+      std::to_string(values.size()) + ".");
+  }
+  std::array<double, 7> out{};
+  std::copy(values.begin(), values.end(), out.begin());
+  return out;
+}
+
+std::array<double, 9> asVector9(const YAML::Node & node, const std::string & key) {
+  if (!node.IsSequence()) {
+    throw std::invalid_argument("config key '" + key + "': expected a list of 9 numbers.");
+  }
+  std::vector<double> values;
+  try {
+    values = node.as<std::vector<double>>();
+  } catch (const YAML::Exception &) {
+    throw std::invalid_argument("config key '" + key + "': expected 9 numbers.");
+  }
+  if (values.size() != 9) {
+    throw std::invalid_argument(
+      "config key '" + key + "': expected exactly 9 numbers, got " +
+      std::to_string(values.size()) + ".");
+  }
+  std::array<double, 9> out{};
   std::copy(values.begin(), values.end(), out.begin());
   return out;
 }
@@ -150,6 +210,33 @@ LoadResult loadConfigFile(
     }
   }
 
+  if (const YAML::Node geometry = root["tool_geometry"]) {
+    if (const YAML::Node v = geometry["sensor_mount_rpy_deg"]) {
+      config.sensor_mount_rpy_deg = asVector3(v, "tool_geometry.sensor_mount_rpy_deg");
+    }
+    if (const YAML::Node v = geometry["flange_to_tcp"]) {
+      config.flange_to_tcp = asVector3(v, "tool_geometry.flange_to_tcp");
+    }
+    if (const YAML::Node v = geometry["sensor_to_tcp"]) {
+      config.sensor_to_tcp = asVector3(v, "tool_geometry.sensor_to_tcp");
+    }
+  }
+
+  if (const YAML::Node payload = root["payload"]) {
+    if (const YAML::Node v = payload["enabled"]) {
+      config.set_payload = asBool(v, "payload.enabled");
+    }
+    if (const YAML::Node v = payload["mass"]) {
+      config.payload_mass = asDouble(v, "payload.mass");
+    }
+    if (const YAML::Node v = payload["center_of_mass"]) {
+      config.payload_center_of_mass = asVector3(v, "payload.center_of_mass");
+    }
+    if (const YAML::Node v = payload["inertia"]) {
+      config.payload_inertia = asVector9(v, "payload.inertia");
+    }
+  }
+
   TargetSource target_source = TargetSource::kDefault;
   if (const YAML::Node target = root["target"]) {
     const YAML::Node pose = target["pose"];
@@ -180,7 +267,22 @@ LoadResult loadConfigFile(
   }
 
   if (const YAML::Node adm = root["admittance"]) {
+    if (const YAML::Node v = adm["frame"]) {
+      config.admittance_frame = v.as<std::string>();
+    }
     applyAdmittance(adm, config, "admittance");
+  }
+
+  // Joint-space impedance gains: independent of the Cartesian admittance profiles. Each key
+  // is optional; a missing key keeps the built-in default so an absent section preserves the
+  // original hard-coded gains.
+  if (const YAML::Node ji = root["joint_impedance"]) {
+    if (const YAML::Node v = ji["stiffness"]) {
+      config.joint_stiffness = asVector7(v, "joint_impedance.stiffness");
+    }
+    if (const YAML::Node v = ji["damping"]) {
+      config.joint_damping = asVector7(v, "joint_impedance.damping");
+    }
   }
 
   if (const YAML::Node lim = root["limits"]) {
@@ -246,6 +348,9 @@ LoadResult loadConfigFile(
     if (const YAML::Node v = log["print_period"]) {
       config.print_period = asDouble(v, "logging.print_period");
     }
+    if (const YAML::Node v = log["plot_filter_comparison"]) {
+      config.plot_filter_comparison = asBool(v, "logging.plot_filter_comparison");
+    }
   }
 
   // Select and apply the admittance preset: --profile if given, else default_profile.
@@ -288,11 +393,93 @@ void validateConfig(const CartesianAdmittanceConfig & config) {
   if (!std::isfinite(config.wrench_sign)) {
     throw std::invalid_argument("wrench.sign must be finite.");
   }
+  if (config.admittance_frame != "body") {
+    throw std::invalid_argument(
+      "admittance.frame must be 'body' (moving desired-TCP body frame).");
+  }
+  const auto validateVector3 = [](const std::array<double, 3> & values, const char * key) {
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (!std::isfinite(values[i])) {
+        throw std::invalid_argument(
+          std::string(key) + "[" + std::to_string(i) + "] must be finite.");
+      }
+    }
+  };
+  validateVector3(config.sensor_mount_rpy_deg, "tool_geometry.sensor_mount_rpy_deg");
+  validateVector3(config.flange_to_tcp, "tool_geometry.flange_to_tcp");
+  validateVector3(config.sensor_to_tcp, "tool_geometry.sensor_to_tcp");
+  if (!std::isfinite(config.payload_mass) || config.payload_mass < 0.0) {
+    throw std::invalid_argument("payload.mass must be finite and non-negative.");
+  }
+  validateVector3(config.payload_center_of_mass, "payload.center_of_mass");
+  for (size_t i = 0; i < config.payload_inertia.size(); ++i) {
+    if (!std::isfinite(config.payload_inertia[i])) {
+      throw std::invalid_argument(
+        "payload.inertia[" + std::to_string(i) + "] must be finite.");
+    }
+  }
+  if (config.set_payload) {
+    const Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::ColMajor>> inertia(
+      config.payload_inertia.data());
+    if (!inertia.isApprox(inertia.transpose(), 1.0e-12)) {
+      throw std::invalid_argument("payload.inertia must be symmetric.");
+    }
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigensolver(inertia);
+    if (eigensolver.info() != Eigen::Success || eigensolver.eigenvalues().minCoeff() <= 0.0) {
+      throw std::invalid_argument(
+        "payload.inertia must be positive definite; Franka Control rejects a zero matrix.");
+    }
+    const Eigen::Vector3d principal = eigensolver.eigenvalues();
+    if (principal(2) > principal(0) + principal(1) + 1.0e-12) {
+      throw std::invalid_argument(
+        "payload.inertia principal moments must satisfy Imax <= Iother1 + Iother2.");
+    }
+  }
+  // Joint-space impedance gains: every stiffness/damping value must be finite and >= 0.
+  // Reject NaN, +/-inf and negatives; never silently substitute a default. The error names
+  // the array (stiffness vs damping), the 0-based index, the 1-based joint and the value.
+  const auto validateJointGains =
+    [](const std::array<double, 7> & gains, const char * key) {
+      for (int i = 0; i < 7; ++i) {
+        const double value = gains[static_cast<size_t>(i)];
+        if (!std::isfinite(value) || value < 0.0) {
+          throw std::invalid_argument(
+            std::string(key) + "[" + std::to_string(i) + "] for joint " +
+            std::to_string(i + 1) + " must be finite and non-negative (got " +
+            std::to_string(value) + ").");
+        }
+      }
+    };
+  validateJointGains(config.joint_stiffness, "joint_impedance.stiffness");
+  validateJointGains(config.joint_damping, "joint_impedance.damping");
+  // config.plot_filter_comparison is a plain boolean: its spelling is already validated
+  // where it is parsed (asBool for YAML, parseBoolArg for the CLI), so it needs no extra
+  // range/consistency check here. It only enables comparison logging and post-run plotting
+  // and never affects the control pipeline, so no combination of it with other options is
+  // invalid.
+}
+
+// Parse a command-line boolean value (true/false/1/0/yes/no/on/off), case-insensitive.
+bool parseBoolArg(const std::string & raw, const std::string & flag) {
+  std::string lower;
+  lower.reserve(raw.size());
+  for (char c : raw) {
+    lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  if (lower == "true" || lower == "1" || lower == "yes" || lower == "on") {
+    return true;
+  }
+  if (lower == "false" || lower == "0" || lower == "no" || lower == "off") {
+    return false;
+  }
+  throw std::invalid_argument(
+    flag + " expects a boolean (true/false), got '" + raw + "'.");
 }
 
 // ---------------------------------------------------------------------------
-// CLI: only a leading hostname, --robot-hostname, --config and --help remain.
-// Everything else is configured through the YAML file.
+// CLI: only a leading hostname, --robot-hostname, --config, --profile,
+// --plot-filter-comparison and --help remain. Everything else is configured
+// through the YAML file.
 // ---------------------------------------------------------------------------
 
 struct CliArgs {
@@ -300,6 +487,8 @@ struct CliArgs {
   std::string config_path = kDefaultConfigPath;
   std::optional<std::string> robot_hostname;   // explicit override, applied after YAML load
   std::optional<std::string> profile;          // admittance preset override (e.g. soft/hard)
+  // Only set when --plot-filter-comparison is given; overrides the YAML value when present.
+  std::optional<bool> plot_filter_comparison;
 };
 
 CliArgs parseCli(const std::vector<std::string> & args) {
@@ -322,6 +511,11 @@ CliArgs parseCli(const std::vector<std::string> & args) {
     } else if (opt == "--profile") {
       if (i + 1 >= args.size()) throw std::invalid_argument("--profile requires a value.");
       cli.profile = args[++i];
+    } else if (opt == "--plot-filter-comparison") {
+      if (i + 1 >= args.size()) {
+        throw std::invalid_argument("--plot-filter-comparison requires a value (true/false).");
+      }
+      cli.plot_filter_comparison = parseBoolArg(args[++i], "--plot-filter-comparison");
     } else {
       throw std::invalid_argument(
         "Unknown option '" + opt + "'. Most parameters now live in the YAML config; "
@@ -334,15 +528,17 @@ CliArgs parseCli(const std::vector<std::string> & args) {
 void printHelp(const std::string & program) {
   std::cout <<
     "Usage: " << program
-              << " [robot-hostname] [--config <path>] [--profile <name>] [--robot-hostname <ip>] [--help]\n"
+              << " [robot-hostname] [--config <path>] [--profile <name>] [--robot-hostname <ip>]\n"
+    "                             [--plot-filter-comparison <bool>] [--help]\n"
     "\n"
     "Cartesian admittance controller (libfranka). Ramps the TCP to a target pose in the\n"
     "world/base frame with a minimum-jerk profile, then holds it while staying compliant.\n"
     "The target is always a full TCP pose (O_T_TCP_target), never a flange pose.\n"
     "\n"
-    "Almost every parameter -- wrench source, target pose, admittance gains, safety\n"
-    "limits, settling detector and logging/plotting -- now comes from a YAML config file.\n"
-    "Edit that file instead of passing long command lines.\n"
+    "Almost every parameter -- wrench source, target pose, Cartesian admittance gains,\n"
+    "joint-space impedance gains (joint_impedance: stiffness/damping, ordered joint1..7),\n"
+    "safety limits, settling detector and logging/plotting -- now comes from a YAML config\n"
+    "file. Edit that file instead of passing long command lines.\n"
     "\n"
     "Options:\n"
     "  [robot-hostname]       Optional leading robot IP; overrides robot.hostname in YAML.\n"
@@ -351,6 +547,11 @@ void printHelp(const std::string & program) {
     "                         (default: " << kDefaultConfigPath << ")\n"
     "  --profile <name>       Admittance preset from the YAML 'profiles:' section, e.g.\n"
     "                         'soft' or 'hard'. Overrides the file's default_profile.\n"
+    "  --plot-filter-comparison <bool>\n"
+    "                         Record the unfiltered (pre-low-pass) and filtered F/T force,\n"
+    "                         then after control stops write a CSV and a four-subplot PNG to\n"
+    "                         src/my_controller/scripts/wrench_filter_comparison. Overrides\n"
+    "                         logging.plot_filter_comparison in the YAML file.\n"
     "  --help, -h             Show this help and exit.\n"
     "\n"
     "Example:\n"
@@ -376,7 +577,9 @@ void printSummary(
             << "Profile: " << (profile.empty() ? "none" : profile) << "\n"
             << "Robot: " << config.robot_hostname << "\n"
             << "Wrench source: " << config.wrench_source << " (frame " << config.wrench_frame
-            << ", sign " << config.wrench_sign << ")\n";
+            << ", sign " << config.wrench_sign << ")\n"
+            << "Admittance frame: desired TCP " << config.admittance_frame
+            << " (external-wrench offset only)\n";
   if (config.wrench_source == "serial") {
     std::cout << "Serial port: " << config.serial_port << "\n";
   }
@@ -404,6 +607,15 @@ void printSummary(
   printVec("Stiffness [Fx Fy Fz Mx My Mz]", config.admittance_stiffness);
   printVec("Damping [Fx Fy Fz Mx My Mz]", config.admittance_damping);
 
+  // Effective joint-space impedance gains (after applying the YAML config), independent of
+  // the Cartesian profile above.
+  const auto printVec7 = [](const char * label, const std::array<double, 7> & v) {
+    std::cout << label << ":\n[" << v[0] << " " << v[1] << " " << v[2] << " " << v[3] << " "
+              << v[4] << " " << v[5] << " " << v[6] << "]\n";
+  };
+  printVec7("Joint stiffness K [J1 J2 J3 J4 J5 J6 J7] [Nm/rad]", config.joint_stiffness);
+  printVec7("Joint damping D [J1 J2 J3 J4 J5 J6 J7] [Nms/rad]", config.joint_damping);
+
   std::cout << "Ramp " << config.target_ramp_time << " s, run-time " << config.run_time
             << " s, stop-on-settled " << (config.stop_on_settled ? "true" : "false") << "\n"
             << "CSV log-pose-error " << (config.log_pose_error ? "true" : "false")
@@ -412,6 +624,9 @@ void printSummary(
             << " | print-pose-error " << (config.print_pose_error ? "true" : "false")
             << " | print-wrench-debug " << (config.print_wrench_debug ? "true" : "false")
             << " | print-period " << config.print_period << " s\n"
+            << "Filter comparison logging/plot: "
+            << (config.plot_filter_comparison ? "true" : "false")
+            << " (output dir src/my_controller/scripts/wrench_filter_comparison)\n"
             << "Press Enter to start..." << std::endl;
 }
 
@@ -439,9 +654,13 @@ int main(int argc, char ** argv) {
   try {
     // 2. Load the YAML file into the config (applying the selected admittance profile).
     loaded = loadConfigFile(cli.config_path, cli.profile, config);
-    // 3. Apply explicit CLI overrides (currently just the robot hostname).
+    // 3. Apply explicit CLI overrides. Each override is applied only when the flag was
+    //    actually given on the command line, so it takes precedence over the YAML value.
     if (cli.robot_hostname) {
       config.robot_hostname = *cli.robot_hostname;
+    }
+    if (cli.plot_filter_comparison) {
+      config.plot_filter_comparison = *cli.plot_filter_comparison;
     }
     // 4. Validate the resulting config.
     validateConfig(config);
@@ -465,6 +684,5 @@ int main(int argc, char ** argv) {
   }
 
   // 7. Run the controller (all file I/O and parsing above happen before this point).
-  my_controller::runCartesianAdmittanceToTarget(config);
-  return 0;
+  return my_controller::runCartesianAdmittanceToTarget(config) ? 0 : 1;
 }

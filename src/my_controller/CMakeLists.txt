@@ -93,6 +93,10 @@ add_executable(cartesian_admittance_libfranka
 )
 set_target_properties(cartesian_admittance_libfranka PROPERTIES OUTPUT_NAME cartesian_admittance)
 
+add_executable(cartesian_admittance_trajectory
+  scripts/cartesian_admittance_trajectory.cpp
+)
+
 add_executable(read_hex21
   scripts/read_hex21.cpp
 )
@@ -147,6 +151,12 @@ target_link_libraries(cartesian_admittance_libfranka
     yaml-cpp::yaml-cpp
 )
 
+target_link_libraries(cartesian_admittance_trajectory
+  PRIVATE
+    cartesian_admittance_lib
+    yaml-cpp::yaml-cpp
+)
+
 ament_target_dependencies(impedance_controller_test
   PUBLIC
     rclcpp
@@ -161,6 +171,12 @@ ament_target_dependencies(franka_home_position
 )
 
 ament_target_dependencies(cartesian_admittance_libfranka
+  PUBLIC
+    rclcpp
+    geometry_msgs
+)
+
+ament_target_dependencies(cartesian_admittance_trajectory
   PUBLIC
     rclcpp
     geometry_msgs
@@ -192,8 +208,18 @@ install(
 )
 
 install(
+  TARGETS cartesian_admittance_trajectory
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
   TARGETS read_hex21
   RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  PROGRAMS scripts/run_pickled_admittance_trajectories.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 # Default YAML config for the cartesian_admittance wrapper. The wrapper loads it from the

@@ -6,12 +6,20 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <optional>
 #include <string>
 
 #include <Eigen/Dense>
 
 namespace my_controller {
+
+using CartesianTargetProvider = std::function<void(
+  double elapsed_time,
+  const Eigen::Vector3d & initial_position_world,
+  const Eigen::Matrix3d & initial_rotation_world,
+  Eigen::Vector3d & target_position_world,
+  Eigen::Matrix3d & target_rotation_world)>;
 
 struct CartesianAdmittanceConfig {
   std::string robot_hostname = "10.90.90.10";
@@ -22,6 +30,22 @@ struct CartesianAdmittanceConfig {
   std::string wrench_frame = "local";       // "local" or "world"
   double wrench_sign = 1.0;
 
+  // F/T sensor mounting and rigid tool geometry. RPY is the sensor->flange coordinate
+  // mapping in degrees, with R = Rz(yaw)*Ry(pitch)*Rx(roll). Translation vectors are in
+  // meters and expressed in their named source frame.
+  std::array<double, 3> sensor_mount_rpy_deg = {0.0, 0.0, -135.0};
+  std::array<double, 3> flange_to_tcp = {0.0, 0.0, 0.1215};
+  std::array<double, 3> sensor_to_tcp = {0.0, 0.0, 0.1066};
+
+  // Optional physical payload passed to libfranka for gravity/dynamics compensation.
+  // The center of mass is expressed in the flange frame [m]; inertia is about that center
+  // of mass [kg*m^2], stored column-major. When enabled, the inertia must be symmetric,
+  // positive definite and satisfy the principal-moment triangle inequality.
+  bool set_payload = false;
+  double payload_mass = 0.0;
+  std::array<double, 3> payload_center_of_mass = {0.0, 0.0, 0.0};
+  std::array<double, 9> payload_inertia = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
   // Desired TCP position expressed in the world/base frame.
   Eigen::Vector3d target_position_world = Eigen::Vector3d(0.45, 0.0, 0.35);
 
@@ -29,12 +53,31 @@ struct CartesianAdmittanceConfig {
   // measured at the start of the run is held.
   std::optional<Eigen::Matrix3d> target_rotation_world;
 
-  // Admittance gains, order [Fx, Fy, Fz, Mx, My, Mz] (world frame). The mask enables
-  // (1.0) or disables (0.0) each Cartesian axis so one DOF can be tuned at a time.
+  // Optional dynamic target generator. When set, the controller calls this once per
+  // control cycle after measuring the initial TCP pose, and uses the returned world-frame
+  // TCP pose instead of the fixed target/ramp above.
+  CartesianTargetProvider target_provider;
+
+  // The admittance operates on a compliant offset expressed in the moving desired TCP body
+  // frame. The nominal world-frame trajectory bypasses this virtual dynamics and the offset
+  // converges to zero when no external wrench is present.
+  std::string admittance_frame = "body";
+
+  // Admittance gains, order [Fx, Fy, Fz, Mx, My, Mz] in the desired TCP body frame. The
+  // mask enables (1.0) or disables (0.0) each body axis so one DOF can be tuned at a time.
   std::array<double, 6> admittance_mass = {2.0, 2.0, 2.0, 0.50, 0.50, 0.50};
   std::array<double, 6> admittance_stiffness = {800.0, 800.0, 800.0, 5.0, 5.0, 5.0};
   std::array<double, 6> admittance_damping = {60.0, 60.0, 60.0, 3.5, 3.5, 3.5};
   std::array<double, 6> admittance_mask = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+
+  // Joint-space impedance gains for the inner joint-impedance torque law, ordered
+  // [joint1, joint2, joint3, joint4, joint5, joint6, joint7]. These are independent of the
+  // Cartesian admittance profiles: --profile soft/hard only changes the Cartesian gains
+  // above, never these. Defaults match the previously hard-coded gains, so an absent
+  // joint_impedance YAML section preserves the original behavior. Units: Nm/rad
+  // (stiffness), Nms/rad (damping).
+  std::array<double, 7> joint_stiffness = {120.0, 120.0, 120.0, 120.0, 80.0, 80.0, 40.0};
+  std::array<double, 7> joint_damping = {22.0, 22.0, 22.0, 22.0, 18.0, 18.0, 13.0};
 
   double max_translation_offset = 0.15;   // m
   double max_rotation_offset = 0.75;      // rad
@@ -66,6 +109,13 @@ struct CartesianAdmittanceConfig {
   std::string plot_output_dir = "src/my_controller/admittance_fitting";
   std::string plot_script = "src/my_controller/admittance_fitting/plot_ft_and_pose_error.py";
 
+  // Comparison logging (separate from the pose-error CSV/plot above): when enabled the
+  // controller records the external force immediately before the low-pass filter and the
+  // filter output for every control cycle, then writes a CSV and a four-subplot PNG under
+  // scripts/wrench_filter_comparison after control stops. This is comparison-only; the
+  // admittance loop keeps using the filtered wrench regardless of this flag.
+  bool plot_filter_comparison = false;
+
   // Terminal live printing, independent of CSV logging. These only affect what the
   // non-real-time printer thread prints; the force sensor, wrench pipeline, bias removal,
   // mask, deadband, saturation, filtering and admittance control always run regardless.
@@ -84,7 +134,8 @@ struct CartesianAdmittanceConfig {
 // admittance loop stays active. Blocks until run_time elapses, *stop_requested is set,
 // ROS is shut down (Ctrl+C), or a franka exception is thrown. Exceptions are caught and
 // reported internally, and the wrench history is dumped on a franka::ControlException.
-void runCartesianAdmittanceToTarget(const CartesianAdmittanceConfig& config);
+// Returns true only when libfranka control returned normally.
+bool runCartesianAdmittanceToTarget(const CartesianAdmittanceConfig& config);
 
 // Build a rotation matrix from roll/pitch/yaw (rad): R = Rz(yaw)*Ry(pitch)*Rx(roll).
 inline Eigen::Matrix3d rpyToRotationMatrix(double roll, double pitch, double yaw) {

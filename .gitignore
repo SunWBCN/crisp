@@ -6,6 +6,13 @@ install/
 CMakeFiles/
 __pycache__/
 *.py[cod]
+
+# Generated images and CSV data
+*.png
+*.jpg
+*.jpeg
+*.csv
+
 src/crisp_controllers/
 src/franka_description/
 src/franka_ros2/
