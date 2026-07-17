@@ -387,9 +387,9 @@ void validateConfig(const CartesianAdmittanceConfig & config) {
   if (!std::isfinite(config.wrench_sign)) {
     throw std::invalid_argument("wrench.sign must be finite.");
   }
-  if (config.admittance_frame != "body") {
+  if (config.admittance_frame != "actual_tcp") {
     throw std::invalid_argument(
-      "admittance.frame must be 'body' (moving desired-TCP body frame).");
+      "admittance.frame must be 'actual_tcp' (moving measured-TCP frame).");
   }
   const auto validateVector3 = [](const std::array<double, 3> & values, const char * key) {
     for (size_t i = 0; i < values.size(); ++i) {
@@ -962,7 +962,7 @@ void printSummary(
             << "Robot: " << config.robot_hostname << "\n"
             << "Wrench source: " << config.wrench_source << " (frame " << config.wrench_frame
             << ", sign " << config.wrench_sign << ")\n"
-            << "Admittance frame: desired TCP " << config.admittance_frame
+            << "Admittance frame: measured TCP " << config.admittance_frame
             << " (external-wrench offset only)\n";
   if (config.wrench_source == "serial") {
     std::cout << "Serial port: " << config.serial_port << "\n";

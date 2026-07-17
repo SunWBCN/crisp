@@ -32,13 +32,15 @@ wrench:
 # Translation vectors are [x, y, z] in meters and expressed in the named source frame.
 tool_geometry:
   sensor_mount_rpy_deg: [0.0, 0.0, -135.0]  # [roll, pitch, yaw], degrees
+  # flange_to_tcp: [0.0, 0.0, 0.0]
   flange_to_tcp: [0.0, 0.0, 0.1616]         # flange origin -> stick tip/TCP
+  # sensor_to_tcp: [0.0, 0.0, 0.0]
   sensor_to_tcp: [0.0, 0.0, 0.1467]         # sensor origin -> stick tip/TCP
 
 # Physical payload used by libfranka for gravity/dynamics compensation. This is separate
 # from admittance.mass, which is only the virtual mass of the compliance controller.
 payload:
-  enabled: true
+  enabled: false
   mass: 0.065                              # kg; total additional payload = 65 g
   center_of_mass: [0.0, 0.0, 0.030]       # [x, y, z] from flange, meters
   # Inertia about the payload CoM, column-major [kg*m^2]. A zero matrix is rejected by
@@ -59,10 +61,10 @@ default_profile: soft
 
 admittance:
   # The nominal trajectory remains in world coordinates. External wrench and compliant
-  # pose offset are expressed in the moving desired-TCP body frame; MKD therefore stay
-  # attached to the tool axes. The selected profile supplies stiffness and damping (and
-  # may override mask/mass if it lists them).
-  frame: body
+  # pose offset are expressed in the moving, actually measured TCP frame; MKD therefore
+  # follow the real tool axes, including compliant orientation error. The selected profile
+  # supplies stiffness and damping (and may override mask/mass if it lists them).
+  frame: actual_tcp
   mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
   mass: [2.0, 2.0, 2.0, 0.5, 0.5, 0.5]
 

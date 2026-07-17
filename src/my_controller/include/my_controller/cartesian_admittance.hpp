@@ -58,13 +58,13 @@ struct CartesianAdmittanceConfig {
   // TCP pose instead of the fixed target/ramp above.
   CartesianTargetProvider target_provider;
 
-  // The admittance operates on a compliant offset expressed in the moving desired TCP body
-  // frame. The nominal world-frame trajectory bypasses this virtual dynamics and the offset
+  // The admittance equation is evaluated in the moving, actually measured TCP frame. The
+  // nominal world-frame trajectory bypasses this virtual dynamics and the compliant offset
   // converges to zero when no external wrench is present.
-  std::string admittance_frame = "body";
+  std::string admittance_frame = "actual_tcp";
 
-  // Admittance gains, order [Fx, Fy, Fz, Mx, My, Mz] in the desired TCP body frame. The
-  // mask enables (1.0) or disables (0.0) each body axis so one DOF can be tuned at a time.
+  // Admittance gains, order [Fx, Fy, Fz, Mx, My, Mz] in the actual TCP frame. The mask
+  // enables (1.0) or disables (0.0) each measured TCP axis so one DOF can be tuned at a time.
   std::array<double, 6> admittance_mass = {2.0, 2.0, 2.0, 0.50, 0.50, 0.50};
   std::array<double, 6> admittance_stiffness = {800.0, 800.0, 800.0, 5.0, 5.0, 5.0};
   std::array<double, 6> admittance_damping = {60.0, 60.0, 60.0, 3.5, 3.5, 3.5};
