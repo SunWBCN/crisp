@@ -25,11 +25,13 @@ find_package(pluginlib REQUIRED)
 find_package(realtime_tools REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(crisp_controllers REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(parameter_traits REQUIRED)
 find_package(rclcpp_action REQUIRED)
@@ -88,6 +90,29 @@ ament_target_dependencies(cartesian_admittance_lib
     geometry_msgs
 )
 
+# TCP-aware controller kept as a separate library while the original controller remains in use by
+# the existing executables.  The verifier below therefore cannot accidentally link the legacy
+# flange/EE implementation.
+add_library(tcp_cartesian_admittance_lib STATIC
+  scripts/TCP_admittance/cartesian_admittance_controller_tcp.cpp
+)
+target_include_directories(tcp_cartesian_admittance_lib
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(tcp_cartesian_admittance_lib
+  PUBLIC
+    Franka::Franka
+    ${MY_CONTROLLER_EIGEN_TARGET}
+    Threads::Threads
+)
+ament_target_dependencies(tcp_cartesian_admittance_lib
+  PUBLIC
+    rclcpp
+    geometry_msgs
+)
+
 add_executable(cartesian_admittance_libfranka
   scripts/cartesian_admittance.cpp
 )
@@ -95,6 +120,15 @@ set_target_properties(cartesian_admittance_libfranka PROPERTIES OUTPUT_NAME cart
 
 add_executable(cartesian_admittance_trajectory
   scripts/cartesian_admittance_trajectory.cpp
+)
+
+add_executable(tcp_admittance_verify
+  scripts/TCP_admittance/verify_tcp_admittance.cpp
+)
+target_compile_definitions(tcp_admittance_verify
+  PRIVATE
+    TCP_ADMITTANCE_DEFAULT_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/scripts/TCP_admittance/cartesian_admittance_tcp.yaml"
+    TCP_ADMITTANCE_DEFAULT_LOG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/scripts/TCP_admittance/verification_logs"
 )
 
 add_executable(read_hex21
@@ -157,6 +191,12 @@ target_link_libraries(cartesian_admittance_trajectory
     yaml-cpp::yaml-cpp
 )
 
+target_link_libraries(tcp_admittance_verify
+  PRIVATE
+    tcp_cartesian_admittance_lib
+    yaml-cpp::yaml-cpp
+)
+
 ament_target_dependencies(impedance_controller_test
   PUBLIC
     rclcpp
@@ -180,6 +220,14 @@ ament_target_dependencies(cartesian_admittance_trajectory
   PUBLIC
     rclcpp
     geometry_msgs
+)
+
+ament_target_dependencies(tcp_admittance_verify
+  PUBLIC
+    rclcpp
+    geometry_msgs
+    sensor_msgs
+    tf2_ros
 )
 
 pluginlib_export_plugin_description_file(controller_interface my_controller.xml)
@@ -213,6 +261,11 @@ install(
 )
 
 install(
+  TARGETS tcp_admittance_verify
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
   TARGETS read_hex21
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
@@ -231,6 +284,21 @@ install(
 )
 
 install(
+  FILES scripts/TCP_admittance/cartesian_admittance_tcp.yaml
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(
+  FILES scripts/TCP_admittance/tcp_admittance_frames.rviz
+  DESTINATION share/${PROJECT_NAME}/rviz
+)
+
+install(
+  DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+)
+
+install(
   DIRECTORY include/
   DESTINATION include
 )
@@ -244,11 +312,13 @@ ament_export_dependencies(
   realtime_tools
   generate_parameter_library
   std_msgs
+  sensor_msgs
   crisp_controllers
   geometry_msgs
   rcl_interfaces
   controller_manager_msgs
   tf2
+  tf2_ros
   Eigen3
   parameter_traits
   rclcpp_action

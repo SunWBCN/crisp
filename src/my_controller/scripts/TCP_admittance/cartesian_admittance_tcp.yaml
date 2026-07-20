@@ -1,0 +1,146 @@
+# Configuration for:
+#   pixi run -e jazzy-crisp ros2 run my_controller tcp_admittance_verify \
+#     --config /home/wenbin/github_repo/crisp_franka/src/my_controller/scripts/TCP_admittance/cartesian_admittance_tcp.yaml
+# Add --execute only after reviewing the verifier's dry-run plan.
+#
+# The executable loads this file (or the one passed with --config) before starting the
+# real-time controller. Every key below is optional: a missing key keeps the built-in
+# default. The robot hostname (leading CLI arg / --robot-hostname) and the admittance
+# preset (--profile soft|hard) can be overridden on the command line.
+#
+# Two different vector conventions are used, so keep them distinct:
+#   * Cartesian admittance vectors (admittance:/profiles: mask, mass, stiffness, damping)
+#     are 6D, ordered [Fx, Fy, Fz, Mx, My, Mz], and must contain exactly 6 numbers. These
+#     are the OUTER task-space compliance gains and are what --profile soft|hard selects.
+#   * Joint-space impedance vectors (joint_impedance: stiffness, damping) are 7D, ordered
+#     [joint1, joint2, joint3, joint4, joint5, joint6, joint7], and must contain exactly 7
+#     numbers. These are the INNER joint-impedance torque-law gains and are completely
+#     independent of the Cartesian admittance profiles (--profile never changes them).
+
+robot:
+  hostname: 10.90.90.10          # overridden by a leading CLI hostname / --robot-hostname
+
+wrench:
+  source: serial                 # franka | topic | serial
+  serial_port: /dev/ttyACM0      # used when source: serial
+  topic: resense_0               # used when source: topic
+  # local: values are in sensor axes at sensor origin; controller applies mounting RPY and
+  #        sensor_to_tcp moment shift. world: values must already use world/base axes and be
+  #        referenced at the physical TCP (WrenchStamped header.frame_id is not inspected).
+  frame: local                   # local | world
+  sign: 1.0
+  filter_alpha: 0.01
+
+# F/T sensor mounting and rigid tool geometry. RPY is the rotation that maps vectors from
+# the SENSOR frame into the flange frame: R_flange_sensor = Rz(yaw)*Ry(pitch)*Rx(roll).
+# Translation vectors are [x, y, z] in meters and expressed in the named source frame.
+# flange_to_tcp always means the physical flange origin -> physical TCP vector. It is not
+# an EE-frame offset; the controller accounts for libfranka's configured F_T_EE separately.
+tool_geometry:
+  sensor_mount_rpy_deg: [0.0, 0.0, -135.0]  # [roll, pitch, yaw], degrees
+  # flange_to_tcp: [0.0, 0.0, 0.0]
+  flange_to_tcp: [0.0, 0.0, 0.1616]         # flange origin -> stick tip/TCP
+  # sensor_to_tcp: [0.0, 0.0, 0.0]
+  sensor_to_tcp: [0.0, 0.0, 0.1467]         # sensor origin -> same physical TCP
+
+# Physical payload used by libfranka for gravity/dynamics compensation. This is separate
+# from admittance.mass, which is only the virtual mass of the compliance controller.
+payload:
+  enabled: true
+  mass: 0.065                              # kg; total additional payload = 65 g
+  center_of_mass: [0.0, 0.0, 0.030]       # [x, y, z] from flange, meters
+  # Inertia about the payload CoM, column-major [kg*m^2]. A zero matrix is rejected by
+  # Franka Control. This small isotropic estimate is used because the motion is slow and
+  # the measured inertia is unavailable; gravity compensation is governed by mass + CoM.
+  inertia: [1.0e-5, 0.0,    0.0,
+            0.0,    1.0e-5, 0.0,
+            0.0,    0.0,    1.0e-5]
+
+target:
+  # Choose ONE target definition:
+  #   pose_source: initial  = capture the physical TCP pose when control starts and hold it
+  #   pose_source: home     = use the predefined absolute home TCP pose in world/base
+  #   pose: [...]           = use an explicit absolute physical TCP pose in world/base
+  # The target is not a delta pose, flange pose, libfranka EE pose, or pose expressed in
+  # either actual/nominal TCP axes. Give EITHER pose_source OR pose, not both.
+  #
+  # The same contract applies when a trajectory target_provider is active: on every control
+  # cycle it must output the absolute physical TCP position and orientation in world/base.
+  # The provider must not output an incremental displacement or a body/local-frame pose. Its
+  # initial_position/initial_rotation inputs are the measured physical TCP at controller start;
+  # return that pose at t=0 and leave orientation on SO(3) (finite, orthonormal, det=+1).
+  pose_source: initial           # hold the arbitrary physical TCP pose present at startup
+  # pose: [0.45, 0.0, 0.35, 0.0, 0.0, 0.0]   # [x,y,z,roll,pitch,yaw]; m and rad
+  ramp_time: 3.0                 # s, minimum-jerk ramp to a static target pose
+
+# Admittance preset used when --profile is not given on the command line.
+default_profile: soft
+
+admittance:
+  # Frame vocabulary:
+  #   actual_tcp  = axes of the instantaneously measured physical TCP pose. Wrench, M/D/K,
+  #                 compliant offset and compliant velocity are expressed in these moving
+  #                 axes. This is selected below.
+  #   nominal_tcp = axes of the nominal/trajectory TCP pose before compliance is added.
+  #                 Use this when compliance directions should follow the planned tool axes.
+  #   world       = fixed robot world/base axes.
+  #
+  # The nominal trajectory itself always consists of absolute physical TCP poses in world/base,
+  # regardless of this setting. The controller expresses wrench/state in the selected frame,
+  # then rotates only the relative compliant offset to world before adding it to the nominal.
+  frame: actual_tcp
+  mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  mass: [2.0, 2.0, 2.0, 0.5, 0.5, 0.5]
+
+profiles:
+  # Switch presets with, e.g.:
+  #   ros2 run my_controller cartesian_admittance 10.90.90.10 --profile hard
+  soft:
+    stiffness: [100.0, 100.0, 100.0, 30.0, 30.0, 15.0] #30 30 10
+    damping:   [28.3, 28.3, 28.3, 7.8, 7.8, 4.5]
+  hard:
+    stiffness: [2400.0, 2400.0, 2400.0, 600.0, 600.0, 100.0]
+    damping:   [139.0, 139.0, 139.0, 35.0, 35.0, 15.0]
+
+# Inner joint-space impedance gains for the joint-impedance torque law
+#   tau_i = K_i (q_d_i - q_i) - D_i * dq_i + coriolis_i.
+# These are 7D, ordered [joint1..joint7], and are INDEPENDENT of the Cartesian admittance
+# profiles above: --profile soft|hard changes only the Cartesian gains, never these. Each
+# key is optional; a missing key keeps the built-in default (the values shown below). Every
+# value must be finite and non-negative.
+joint_impedance:
+  stiffness: [120.0, 120.0, 120.0, 120.0, 80.0, 80.0, 40.0]  # Nm/rad
+  damping:   [22.0, 22.0, 22.0, 22.0, 18.0, 18.0, 12.7]      # Nms/rad
+
+limits:
+  force_deadband: 0              # N
+  max_force: 10.0                # N, saturate measured force magnitude
+  torque_deadband: 0.5           # Nm
+  max_torque: 2.0                # Nm, saturate measured torque magnitude
+  max_translation_offset: 0.15   # m
+  max_rotation_offset: 0.75      # rad
+  max_linear_speed: 0.20         # m/s
+  max_angular_speed: 1.0         # rad/s
+
+run:
+  run_time: -1.0                 # s, negative = run until stopped (Ctrl+C / stop flag)
+  stop_on_settled: false         # stop once the pose settles
+  settle_window: 2.0             # s
+  settle_position_threshold: 0.001   # m
+  settle_rotation_threshold: 0.01    # rad
+  settle_velocity_threshold: 0.005   # m/s and rad/s (inner admittance velocity)
+
+logging:
+  log_pose_error: false           # save a pose-error CSV after control stops
+  pose_log_dir: src/my_controller/admittance_fitting
+  auto_plot: false               # plot the pose-error CSV after control stops
+  plot_output_dir: src/my_controller/admittance_fitting
+  plot_script: src/my_controller/admittance_fitting/plot_ft_and_pose_error.py
+  print_pose_error: false         # periodically print live TCP pose error
+  print_wrench_debug: true        # periodically print wrench pipeline debug data
+  print_period: 0.2               # s, terminal print period
+  # Record the external force just before and just after the low-pass filter, then after
+  # control stops write a CSV + four-subplot PNG (Fx, Fy, Fz, |F|) to
+  # src/my_controller/scripts/wrench_filter_comparison. Comparison-only: the admittance loop
+  # still uses the filtered wrench. Override on the CLI with --plot-filter-comparison true.
+  plot_filter_comparison: false

@@ -21,6 +21,18 @@ using CartesianTargetProvider = std::function<void(
   Eigen::Vector3d & target_position_world,
   Eigen::Matrix3d & target_rotation_world)>;
 
+// Optional real-time pose observer. It is called once per control cycle with the measured
+// physical TCP pose and final compliant TCP command, both in world/base frame O. The observer
+// must be non-blocking and allocation-free; it should only copy into preallocated/atomic storage.
+using CartesianTcpPoseObserver = std::function<void(
+  const Eigen::Vector3d & actual_position_world,
+  const Eigen::Matrix3d & actual_rotation_world,
+  const Eigen::Vector3d & command_position_world,
+  const Eigen::Matrix3d & command_rotation_world)>;
+
+using CartesianJointPositionObserver =
+  std::function<void(const std::array<double, 7> & actual_joint_positions)>;
+
 struct CartesianAdmittanceConfig {
   std::string robot_hostname = "10.90.90.10";
 
@@ -49,6 +61,10 @@ struct CartesianAdmittanceConfig {
   // Desired TCP position expressed in the world/base frame.
   Eigen::Vector3d target_position_world = Eigen::Vector3d(0.45, 0.0, 0.35);
 
+  // Hold the physical TCP pose measured at controller startup. When true, this
+  // overrides target_position_world and target_rotation_world.
+  bool hold_initial_tcp_pose = false;
+
   // Optional desired TCP orientation in world. If unset, the initial TCP orientation
   // measured at the start of the run is held.
   std::optional<Eigen::Matrix3d> target_rotation_world;
@@ -57,6 +73,12 @@ struct CartesianAdmittanceConfig {
   // control cycle after measuring the initial TCP pose, and uses the returned world-frame
   // TCP pose instead of the fixed target/ramp above.
   CartesianTargetProvider target_provider;
+
+  // Optional measured/commanded physical TCP observer for monitoring and visualization.
+  CartesianTcpPoseObserver tcp_pose_observer;
+
+  // Optional measured joint-position observer for monitoring and URDF visualization.
+  CartesianJointPositionObserver joint_position_observer;
 
   // The admittance equation is evaluated in the moving, actually measured TCP frame. The
   // nominal world-frame trajectory bypasses this virtual dynamics and the compliant offset
